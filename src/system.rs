@@ -1,15 +1,16 @@
-//! Sistema: CPU (total, por núcleo y gráfica), GPU (AMD por sysfs), memoria,
-//! temperaturas, discos, red y los procesos que más gastan. Todo sale de /proc
-//! y /sys, una vez por segundo.
+//! Sistema: CPU (total, por núcleo y gráfica), GPU (uso, reloj, consumo,
+//! ventilador y qué procesos la están usando), memoria, temperaturas, discos,
+//! red y los procesos que más gastan. Todo sale de /proc y /sys, una vez por
+//! segundo; lo de la GPU por proceso, del fdinfo de DRM (AMD e Intel).
 
 use crate::{Tab, Ui, l};
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,31 @@ struct Proc {
     name: String,
     args: String, // la línea de comando sin el programa
     cpu: f64,
-    mem: u64, // bytes
+    mem: u64,       // bytes
+    pids: Vec<i32>, // agrupados: todos los de ese nombre
+}
+
+/// La tarjeta: uso y VRAM, y de hwmon reloj, consumo, ventilador y temperaturas.
+#[derive(Clone, Default)]
+struct Gpu {
+    busy: f64,
+    vram: (u64, u64),  // usada, total
+    sclk: u64,         // MHz
+    mclk: u64,         // MHz
+    power: (f64, f64), // W, tope W
+    fan: Option<u64>,  // rpm
+    temps: Vec<(&'static str, f64)>,
+}
+
+/// Un proceso usando la GPU: cuánto de gráficos/cómputo y de video (codificar
+/// o decodificar) en el último segundo, y su VRAM.
+#[derive(Clone)]
+struct GpuProc {
+    pid: i32,
+    name: String,
+    gfx: f64,
+    video: f64,
+    vram: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -38,7 +63,14 @@ pub struct System {
     prev_cpu: Vec<(u64, u64)>, // (ocupado, total) por línea de /proc/stat (0 = total)
     cpu: Vec<f64>,             // 0 = total, luego cada núcleo
     cpu_hist: Vec<f64>,
-    gpu: Option<(f64, u64, u64)>, // uso, vram usada, vram total
+    gpu: Option<Gpu>,
+    gpu_dir: Option<String>,
+    gpu_pdev: String, // "0000:03:00.0": con esto se reconocen sus clientes en fdinfo
+    gpu_name: String,
+    gpu_prev: HashMap<String, (u64, u64, Instant)>, // cliente DRM → ns de gráficos y video
+    gpu_procs: Vec<GpuProc>,
+    gpu_top: usize,
+    gpu_view: bool, // pantalla angosta: la lista de abajo muestra la GPU en vez de los procesos
     gpu_hist: Vec<f64>,
     mem: (u64, u64, u64, u64), // total, disponible, swap total, swap libre
     temps: Vec<(String, f64)>,
@@ -52,9 +84,23 @@ pub struct System {
     follow: bool, // la selección sigue a su proceso (ya te moviste) o se queda en su fila
     filter: String,
     typing: bool,
-    kill: Option<(i32, String)>,
+    group: bool, // juntar los procesos del mismo programa
+    kill: Option<(Vec<i32>, String)>,
     uptime: u64,
     load: String,
+    hits: Hits,
+}
+
+/// Dónde quedó cada cosa al dibujar (para el ratón).
+#[derive(Default)]
+struct Hits {
+    procs: Rect,
+    rows: Vec<(u16, usize)>, // fila de pantalla → proceso de la lista
+    head: u16,               // la fila de los títulos de columna
+    cpu_col: (u16, u16),     // x donde empieza y termina la columna cpu
+    mem_col: (u16, u16),
+    gpu: Rect,
+    gpu_rows: Vec<(u16, i32)>, // fila de pantalla → pid
 }
 
 fn read(p: &str) -> String {
@@ -78,6 +124,84 @@ fn gpu_dir() -> Option<String> {
         .find(|d| fs::metadata(format!("{d}/gpu_busy_percent")).is_ok())
 }
 
+/// El modelo exacto: la tabla de AMD que trae libdrm (la que usa Mesa) lo da
+/// por chip y revisión ("7590, C0" → "AMD Radeon RX 9060 XT"). lspci no
+/// sirve de primera: junta todo lo que lleva el mismo chip ("RX 9050 / 9060 XT").
+fn gpu_name(dir: &str, pdev: &str) -> String {
+    let hex = |f: &str| read(&format!("{dir}/{f}")).trim().trim_start_matches("0x").to_uppercase();
+    let (dev, rev) = (hex("device"), hex("revision"));
+    let ids = ["/usr/share/libdrm/amdgpu.ids", "/usr/local/share/libdrm/amdgpu.ids"].iter().map(|p| read(p)).find(|t| !t.is_empty());
+    let found = ids.as_deref().and_then(|t| {
+        t.lines().find_map(|line| {
+            let mut f = line.splitn(3, ',').map(str::trim);
+            let (d, r, name) = (f.next()?, f.next()?, f.next()?);
+            (d.eq_ignore_ascii_case(&dev) && r.eq_ignore_ascii_case(&rev)).then(|| name.trim_start_matches("AMD ").to_string())
+        })
+    });
+    if let Some(name) = found {
+        return name;
+    }
+    // si no: lspci, "Navi 44 [Radeon RX 9050 / 9060 XT]" → lo de los corchetes
+    let Ok(out) = std::process::Command::new("lspci").args(["-s", pdev, "-mm"]).output() else { return String::new() };
+    let out = String::from_utf8_lossy(&out.stdout);
+    let dev = out.split('"').nth(5).unwrap_or("");
+    match (dev.rfind('['), dev.rfind(']')) {
+        (Some(a), Some(b)) if a < b => dev[a + 1..b].to_string(),
+        _ => dev.to_string(),
+    }
+}
+
+/// "12 KiB" → bytes
+fn size(v: &str) -> u64 {
+    let mut it = v.split_whitespace();
+    let n: u64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    n * match it.next() {
+        Some("KiB") => 1 << 10,
+        Some("MiB") => 1 << 20,
+        Some("GiB") => 1 << 30,
+        _ => 1,
+    }
+}
+
+/// Los clientes DRM de un proceso en la GPU `pdev`: (id, ns de gráficos y
+/// cómputo, ns de video, VRAM). Un mismo cliente puede estar en varios fd.
+fn drm_clients(pid: i32, pdev: &str) -> Vec<(String, u64, u64, u64)> {
+    let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else { return Vec::new() };
+    let mut out: Vec<(String, u64, u64, u64)> = Vec::new();
+    for fd in fds.flatten() {
+        if !fs::read_link(fd.path()).is_ok_and(|t| t.starts_with("/dev/dri")) {
+            continue;
+        }
+        let info = read(&format!("/proc/{pid}/fdinfo/{}", fd.file_name().to_string_lossy()));
+        let (mut id, mut ours, mut gfx, mut video, mut vram, mut vram_old) = (None, false, 0, 0, None, None);
+        for line in info.lines() {
+            let Some((k, v)) = line.split_once(':') else { continue };
+            let v = v.trim();
+            match k {
+                "drm-client-id" => id = Some(v.to_string()),
+                "drm-pdev" => ours = v == pdev,
+                "drm-resident-vram" => vram = Some(size(v)),
+                "drm-memory-vram" => vram_old = Some(size(v)),
+                _ => {
+                    let Some(e) = k.strip_prefix("drm-engine-") else { continue };
+                    let ns: u64 = v.split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                    if matches!(e, "gfx" | "render" | "compute" | "ccs") {
+                        gfx += ns;
+                    } else if ["enc", "dec", "jpeg", "video", "vcn"].iter().any(|x| e.contains(x)) && !e.starts_with("capacity") {
+                        video += ns;
+                    }
+                }
+            }
+        }
+        if let (Some(id), true) = (id, ours) {
+            if !out.iter().any(|c| c.0 == id) {
+                out.push((id, gfx, video, vram.or(vram_old).unwrap_or(0)));
+            }
+        }
+    }
+    out
+}
+
 /// "AMD Ryzen 5 8400F 6-Core Processor" → "Ryzen 5 8400F"
 fn cpu_model() -> String {
     let mi = read("/proc/cpuinfo");
@@ -99,7 +223,8 @@ fn uptime(s: u64) -> String {
 
 impl System {
     pub fn new() -> System {
-        System {
+        let dir = gpu_dir();
+        let mut s = System {
             last: None,
             model: cpu_model(),
             freq: 0.0,
@@ -107,6 +232,13 @@ impl System {
             cpu: Vec::new(),
             cpu_hist: Vec::new(),
             gpu: None,
+            gpu_pdev: dir.as_ref().and_then(|d| fs::canonicalize(d).ok()).and_then(|p| Some(p.file_name()?.to_string_lossy().to_string())).unwrap_or_default(),
+            gpu_name: String::new(),
+            gpu_dir: dir,
+            gpu_prev: HashMap::new(),
+            gpu_procs: Vec::new(),
+            gpu_top: 0,
+            gpu_view: false,
             gpu_hist: Vec::new(),
             mem: (0, 0, 0, 0),
             temps: Vec::new(),
@@ -120,22 +252,74 @@ impl System {
             follow: false,
             filter: String::new(),
             typing: false,
+            group: false,
             kill: None,
             uptime: 0,
             load: String::new(),
+            hits: Hits::default(),
+        };
+        if !s.gpu_pdev.is_empty() {
+            s.gpu_name = gpu_name(s.gpu_dir.as_deref().unwrap_or(""), &s.gpu_pdev);
+        }
+        s
+    }
+
+    fn press(&mut self, code: KeyCode, ui: &mut Ui) {
+        self.key(KeyEvent::new(code, KeyModifiers::NONE), ui);
+    }
+
+    /// Ir a un proceso en la lista (desde la de la GPU): sin búsqueda que lo esconda.
+    fn select_pid(&mut self, pid: i32) {
+        if !self.view().iter().any(|p| p.pids.contains(&pid)) {
+            self.filter.clear();
+        }
+        if let Some(i) = self.view().iter().position(|p| p.pids.contains(&pid)) {
+            self.sel = i;
+            self.follow = true;
+            self.gpu_view = false;
         }
     }
 
-    /// Los procesos que pasan el filtro (nombre o línea de comando).
-    fn view(&self) -> Vec<&Proc> {
-        if self.filter.is_empty() {
-            return self.procs.iter().collect();
-        }
+    /// Los procesos que pasan el filtro (nombre o línea de comando); con
+    /// `group`, uno por programa con su CPU y memoria sumadas.
+    fn view(&self) -> Vec<Proc> {
         let f = self.filter.to_lowercase();
-        self.procs
+        let shown = self
+            .procs
             .iter()
-            .filter(|p| p.name.to_lowercase().contains(&f) || p.args.to_lowercase().contains(&f) || p.pid.to_string() == f)
-            .collect()
+            .filter(|p| f.is_empty() || p.name.to_lowercase().contains(&f) || p.args.to_lowercase().contains(&f) || p.pid.to_string() == f);
+        if !self.group {
+            return shown.cloned().collect();
+        }
+        let mut groups: Vec<Proc> = Vec::new();
+        let mut at: HashMap<&str, usize> = HashMap::new();
+        for p in shown {
+            match at.get(p.name.as_str()) {
+                Some(&i) => {
+                    let g = &mut groups[i];
+                    g.cpu += p.cpu;
+                    g.mem += p.mem;
+                    g.pids.push(p.pid);
+                    if p.pid < g.pid {
+                        g.pid = p.pid;
+                        g.args = p.args.clone();
+                    }
+                }
+                None => {
+                    at.insert(&p.name, groups.len());
+                    groups.push(p.clone());
+                }
+            }
+        }
+        self.sort_procs(&mut groups);
+        groups
+    }
+
+    fn sort_procs(&self, v: &mut [Proc]) {
+        match self.sort {
+            Sort::Cpu => v.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.mem.cmp(&a.mem))),
+            Sort::Mem => v.sort_by_key(|p| std::cmp::Reverse(p.mem)),
+        }
     }
 
     fn move_sel(&mut self, by: isize) {
@@ -176,15 +360,40 @@ impl System {
             .collect();
         self.freq = if khz.is_empty() { 0.0 } else { khz.iter().sum::<f64>() / khz.len() as f64 / 1e6 };
 
-        // GPU (AMD)
-        self.gpu = gpu_dir().map(|d| {
-            let busy: f64 = read(&format!("{d}/gpu_busy_percent")).trim().parse().unwrap_or(0.0);
-            let used = read(&format!("{d}/mem_info_vram_used")).trim().parse().unwrap_or(0);
-            let total = read(&format!("{d}/mem_info_vram_total")).trim().parse().unwrap_or(0);
-            (busy / 100.0, used, total)
+        // GPU (AMD): uso y VRAM; de su hwmon, reloj, consumo, ventilador, temperaturas
+        self.gpu = self.gpu_dir.as_ref().map(|d| {
+            let n = |f: &str| read(&format!("{d}/{f}")).trim().parse::<f64>().ok();
+            let hw = fs::read_dir(format!("{d}/hwmon"))
+                .ok()
+                .and_then(|mut r| r.next())
+                .and_then(|e| e.ok())
+                .map(|e| e.path().to_string_lossy().to_string())
+                .unwrap_or_default();
+            let h = |f: &str| read(&format!("{hw}/{f}")).trim().parse::<f64>().ok();
+            let temps = (1..=3)
+                .filter_map(|i| {
+                    let v = h(&format!("temp{i}_input"))?;
+                    let label = match read(&format!("{hw}/temp{i}_label")).trim() {
+                        "edge" => l("borde", "edge"),
+                        "junction" => l("unión", "hotspot"),
+                        "mem" => "mem",
+                        _ => "temp",
+                    };
+                    Some((label, v / 1000.0))
+                })
+                .collect();
+            Gpu {
+                busy: n("gpu_busy_percent").unwrap_or(0.0) / 100.0,
+                vram: (n("mem_info_vram_used").unwrap_or(0.0) as u64, n("mem_info_vram_total").unwrap_or(0.0) as u64),
+                sclk: (h("freq1_input").unwrap_or(0.0) / 1e6) as u64,
+                mclk: (h("freq2_input").unwrap_or(0.0) / 1e6) as u64,
+                power: (h("power1_average").or_else(|| h("power1_input")).unwrap_or(0.0) / 1e6, h("power1_cap").unwrap_or(0.0) / 1e6),
+                fan: h("fan1_input").map(|v| v as u64),
+                temps,
+            }
         });
-        if let Some((b, ..)) = self.gpu {
-            self.gpu_hist.push(b);
+        if let Some(g) = &self.gpu {
+            self.gpu_hist.push(g.busy);
         }
         for h in [&mut self.cpu_hist, &mut self.gpu_hist] {
             if h.len() > HIST {
@@ -275,6 +484,10 @@ impl System {
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         let mut ticks = HashMap::new();
         let mut procs = Vec::new();
+        let gnow = Instant::now();
+        let mut gseen = HashSet::new();
+        let mut gprev = HashMap::new();
+        let mut gprocs = Vec::new();
         if let Ok(dir) = fs::read_dir("/proc") {
             for e in dir.flatten() {
                 let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
@@ -300,21 +513,117 @@ impl System {
                 let prog = argv.next().map(|x| x.rsplit('/').next().unwrap_or(x)).unwrap_or("");
                 let name = if comm.len() >= 15 && prog.starts_with(comm) { prog } else { comm };
                 let args = argv.collect::<Vec<_>>().join(" ");
-                procs.push(Proc { pid, name: name.to_string(), args, cpu, mem: rss });
+                // en la GPU: lo que gastó cada cliente desde la vuelta pasada
+                if !self.gpu_pdev.is_empty() {
+                    let clients = drm_clients(pid, &self.gpu_pdev);
+                    let (mut g, mut v, mut vram, mut any) = (0.0, 0.0, 0, false);
+                    for (id, gfx, video, mem) in clients {
+                        if !gseen.insert(id.clone()) {
+                            continue;
+                        }
+                        any = true;
+                        if let Some(&(pg, pv, pt)) = self.gpu_prev.get(&id) {
+                            let dt = gnow.duration_since(pt).as_nanos().max(1) as f64;
+                            g += gfx.saturating_sub(pg) as f64 / dt;
+                            v += video.saturating_sub(pv) as f64 / dt;
+                        }
+                        vram += mem;
+                        gprev.insert(id, (gfx, video, gnow));
+                    }
+                    if any && (vram > 0 || g > 0.0 || v > 0.0) {
+                        gprocs.push(GpuProc { pid, name: name.to_string(), gfx: g.min(1.0), video: v.min(1.0), vram });
+                    }
+                }
+                procs.push(Proc { pid, name: name.to_string(), args, cpu, mem: rss, pids: vec![pid] });
             }
         }
         self.prev_ticks = ticks;
+        gprocs.sort_by(|a: &GpuProc, b: &GpuProc| (b.gfx + b.video).total_cmp(&(a.gfx + a.video)).then(b.vram.cmp(&a.vram)));
+        self.gpu_procs = gprocs;
+        self.gpu_prev = gprev;
         let keep = self.view().get(self.sel).map(|p| p.pid);
-        match self.sort {
-            Sort::Cpu => procs.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.mem.cmp(&a.mem))),
-            Sort::Mem => procs.sort_by(|a, b| b.mem.cmp(&a.mem)),
-        }
+        self.sort_procs(&mut procs);
         self.procs = procs;
         let view = self.view();
         self.sel = keep
             .filter(|_| self.follow)
             .and_then(|pid| view.iter().position(|p| p.pid == pid))
             .unwrap_or(self.sel.min(view.len().saturating_sub(1)));
+    }
+
+    /// La GPU: reloj, consumo, ventilador, temperaturas y quién la usa.
+    fn draw_gpu(&mut self, f: &mut Frame, area: Rect, ui: &Ui) {
+        let look = &ui.look;
+        let t = look.theme;
+        let Some(g) = self.gpu.clone() else { return };
+        let mut title = vec![Span::styled(format!(" {} ", look.tx("gpu")), Style::new().fg(t.primary).bold())];
+        if !self.gpu_name.is_empty() {
+            title.push(Span::styled(format!("{} ", self.gpu_name), Style::new().fg(t.muted)));
+        }
+        let block = look.block(false).title(Line::from(title));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let w = inner.width as usize;
+        let label = |s: &str| Span::styled(format!("{:<10} ", look.tx(s)), Style::new().fg(t.muted).bold());
+        let mut lines = Vec::new();
+        let (d, r) = look.bar(g.busy, w.saturating_sub(17));
+        lines.push(Line::from(vec![
+            label(l("uso", "load")),
+            Span::styled(d, Style::new().fg(if g.busy > 0.85 { t.accent } else { t.primary })),
+            Span::styled(r, Style::new().fg(t.border)),
+            Span::styled(format!(" {:>4.0}%", g.busy * 100.0), Style::new().fg(t.fg)),
+        ]));
+        if g.sclk > 0 {
+            lines.push(Line::from(vec![
+                label(l("reloj", "clock")),
+                Span::styled(format!("{} MHz", g.sclk), Style::new().fg(t.fg)),
+                Span::styled(format!("   mem {} MHz", g.mclk), Style::new().fg(t.muted)),
+            ]));
+        }
+        if g.power.0 > 0.0 {
+            let right = if g.power.1 > 0.0 { format!(" {:>3.0}/{:.0} W", g.power.0, g.power.1) } else { format!(" {:.0} W", g.power.0) };
+            let frac = if g.power.1 > 0.0 { g.power.0 / g.power.1 } else { 0.0 };
+            let (d, r) = look.bar(frac, w.saturating_sub(11 + right.chars().count()));
+            lines.push(Line::from(vec![
+                label(l("consumo", "power")),
+                Span::styled(d, Style::new().fg(if frac > 0.85 { t.accent } else { t.primary })),
+                Span::styled(r, Style::new().fg(t.border)),
+                Span::styled(right, Style::new().fg(t.fg)),
+            ]));
+        }
+        if let Some(rpm) = g.fan {
+            let fan = if rpm == 0 { l("parado", "stopped").to_string() } else { format!("{rpm} rpm") };
+            lines.push(Line::from(vec![label(l("ventilador", "fan")), Span::styled(fan, Style::new().fg(t.fg))]));
+        }
+        if !g.temps.is_empty() {
+            let temps: String = g.temps.iter().map(|(n, v)| format!("{n} {v:.0}°  ")).collect();
+            lines.push(Line::from(vec![label("temp"), Span::styled(temps, Style::new().fg(t.accent))]));
+        }
+        lines.push(Line::raw(""));
+        let nw = w.saturating_sub(23);
+        lines.push(Line::styled(
+            format!(" {:<nw$} {:>5} {:>6} {:>8}", look.tx(l("usándola", "using it")), "gfx", look.tx("video"), "vram"),
+            Style::new().fg(t.muted).bold(),
+        ));
+        let list_y = inner.y + lines.len() as u16;
+        let room = (inner.height as usize).saturating_sub(lines.len());
+        self.gpu_top = self.gpu_top.min(self.gpu_procs.len().saturating_sub(room.max(1)));
+        let pct = |v: f64| if v >= 0.0005 { format!("{:.0}%", (v * 100.0).max(1.0)) } else { "·".to_string() };
+        for (k, p) in self.gpu_procs.iter().skip(self.gpu_top).take(room).enumerate() {
+            self.hits.gpu_rows.push((list_y + k as u16, p.pid));
+            let name: String = p.name.chars().take(nw).collect();
+            let busy = p.gfx + p.video > 0.0005;
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {name:<nw$}"), Style::new().fg(if busy { t.fg } else { t.muted })),
+                Span::styled(format!(" {:>5} {:>6}", pct(p.gfx), pct(p.video)), Style::new().fg(if busy { t.primary } else { t.muted })),
+                Span::styled(format!(" {:>8}", human(p.vram as f64)), Style::new().fg(t.fg)),
+            ]));
+        }
+        if self.gpu_procs.is_empty() {
+            lines.push(Line::styled(format!(" {}", l("nadie (o no se puede ver)", "nobody (or can't tell)")), Style::new().fg(t.muted)));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+        self.hits.gpu = inner;
     }
 
     /// Gráfica de `h` filas por `w` columnas con lo último de `hist` (0..1).
@@ -366,7 +675,7 @@ impl Tab for System {
         let ncols = (cpu_w / 26).clamp(2, 4);
         let core_rows = ncores.div_ceil(ncols);
         let (mt, ma, st, sf) = self.mem;
-        let side_rows = self.gpu.map_or(0, |g| if g.2 > 0 { 2 } else { 1 })
+        let side_rows = self.gpu.as_ref().map_or(0, |g| if g.vram.1 > 0 { 2 } else { 1 })
             + (mt > 0) as usize
             + (st > 0) as usize
             + self.disks.len()
@@ -435,7 +744,7 @@ impl Tab for System {
             ])
         };
         let mut lines = Vec::new();
-        if let Some((busy, used, total)) = self.gpu {
+        if let Some(Gpu { busy, vram: (used, total), .. }) = self.gpu.clone() {
             let temp = self.temps.iter().find(|x| x.0 == "gpu").map(|x| format!(" {:.0}°", x.1)).unwrap_or_default();
             lines.push(meter("gpu", busy, format!("{:>3.0}%{temp}", busy * 100.0)));
             if total > 0 {
@@ -484,12 +793,33 @@ impl Tab for System {
         }
         f.render_widget(Paragraph::new(lines), inner);
 
+        // abajo: procesos y, si cabe, la GPU al lado (si no, `v` cambia entre las dos)
+        let wide = bottom.width >= 110;
+        let (bottom, gpu_a) = match (&self.gpu, wide) {
+            (Some(_), true) => {
+                let [a, b] = Layout::horizontal([Constraint::Fill(1), Constraint::Length((bottom.width * 2 / 5).clamp(46, 64))]).areas(bottom);
+                (a, Some(b))
+            }
+            (Some(_), false) if self.gpu_view => (Rect::default(), Some(bottom)),
+            _ => (bottom, None),
+        };
+        self.hits = Hits::default();
+        if let Some(a) = gpu_a {
+            self.draw_gpu(f, a, ui);
+        }
+        if bottom.area() == 0 {
+            return;
+        }
+
         // procesos
         let view = self.view();
         let mut title = format!(" {} {} · {} ", look.tx(l("procesos", "processes")), view.len(), look.tx(match self.sort {
             Sort::Cpu => l("por cpu", "by cpu"),
             Sort::Mem => l("por memoria", "by memory"),
         }));
+        if self.group {
+            title.push_str(&format!("· {} ", look.tx(l("por programa", "by program"))));
+        }
         if !self.filter.is_empty() && !self.typing {
             title.push_str(&format!("· /{} ", self.filter));
         }
@@ -504,11 +834,18 @@ impl Tab for System {
         )];
         let first = self.sel.saturating_sub(h.saturating_sub(3));
         let (sel_style, mark) = look.sel(true);
+        let cx = inner.x + 1 + 7 + 2 + nw as u16 + 1;
+        self.hits.procs = inner;
+        self.hits.head = inner.y;
+        self.hits.cpu_col = (cx, cx + 6);
+        self.hits.mem_col = (cx + 7, cx + 15);
         for (i, p) in view.iter().enumerate().skip(first).take(h.saturating_sub(1)) {
             let selected = i == self.sel;
+            self.hits.rows.push((inner.y + 1 + (i - first) as u16, i));
             let name: String = p.name.chars().take(nw).collect();
             let room = nw.saturating_sub(name.chars().count() + 2);
-            let args: String = if room > 0 { p.args.chars().take(room).collect() } else { String::new() };
+            let args = if p.pids.len() > 1 { format!("×{}", p.pids.len()) } else { p.args.clone() };
+            let args: String = if room > 0 { args.chars().take(room).collect() } else { String::new() };
             let pad = nw.saturating_sub(name.chars().count() + if args.is_empty() { 0 } else { 2 + args.chars().count() });
             let (st, dim) = if selected { (sel_style, sel_style) } else { (Style::new().fg(t.fg), Style::new().fg(t.muted)) };
             let mut spans = vec![
@@ -525,15 +862,13 @@ impl Tab for System {
         f.render_widget(Paragraph::new(lines), inner);
 
         // abajo del recuadro: confirmar cierre o lo que vas buscando
-        let prompt = if let Some((pid, name)) = &self.kill {
+        let prompt = if let Some((pids, name)) = &self.kill {
+            let what = match pids.as_slice() {
+                [pid] => format!("{} {name} ({pid})?", l("¿Cerrar", "Kill")),
+                _ => format!("{} {} {name}?", l("¿Cerrar los", "Kill all"), pids.len()),
+            };
             Some((
-                format!(
-                    " {} {name} ({pid})? k {} · K {} · esc {} ",
-                    l("¿Cerrar", "Kill"),
-                    l("sí", "yes"),
-                    l("forzar", "force"),
-                    l("no", "no")
-                ),
+                format!(" {what} k {} · K {} · esc {} ", l("sí", "yes"), l("forzar", "force"), l("no", "no")),
                 Style::new().fg(t.base).bg(t.red).bold(),
             ))
         } else if self.typing {
@@ -553,14 +888,19 @@ impl Tab for System {
     }
 
     fn key(&mut self, k: KeyEvent, ui: &mut Ui) -> bool {
-        if let Some((pid, name)) = self.kill.take() {
+        if let Some((pids, name)) = self.kill.take() {
+            if !matches!(k.code, KeyCode::Char('k' | 'y' | 's' | 'K') | KeyCode::Esc | KeyCode::Char('n')) {
+                self.kill = Some((pids, name)); // otra tecla no cuenta como respuesta
+                return true;
+            }
             let sig = match k.code {
                 KeyCode::Char('k') | KeyCode::Char('y') | KeyCode::Char('s') => Some(libc::SIGTERM),
                 KeyCode::Char('K') => Some(libc::SIGKILL),
                 _ => None,
             };
             if let Some(sig) = sig {
-                if unsafe { libc::kill(pid, sig) } == 0 {
+                let ok = pids.iter().filter(|&&pid| unsafe { libc::kill(pid, sig) } == 0).count();
+                if ok > 0 {
                     ui.say(format!("{name}: {}", l("cerrado", "killed")));
                     self.last = None;
                 } else {
@@ -609,6 +949,11 @@ impl Tab for System {
                 self.last = None;
             }
             KeyCode::Char('/') => self.typing = true,
+            KeyCode::Char('a') => {
+                self.group = !self.group;
+                self.sel = 0;
+                self.follow = false;
+            }
             KeyCode::Esc if !self.filter.is_empty() => {
                 self.filter.clear();
                 self.sel = 0;
@@ -616,30 +961,93 @@ impl Tab for System {
             }
             KeyCode::Char('x') | KeyCode::Delete => {
                 if let Some(p) = self.view().get(self.sel) {
-                    self.kill = Some((p.pid, p.name.clone()));
+                    self.kill = Some((p.pids.clone(), p.name.clone()));
                 }
             }
+            // pkill: los que se llaman como la búsqueda (solo el nombre, como
+            // pkill: por los argumentos caería hasta la terminal que lo lanzó), menos vato
+            KeyCode::Char('X') => {
+                if self.filter.is_empty() {
+                    ui.say(l("Primero busca con /; X cierra los que se llamen así", "Search with / first; X kills the ones with that name"));
+                } else {
+                    let me = std::process::id() as i32;
+                    let f = self.filter.to_lowercase();
+                    let pids: Vec<i32> =
+                        self.procs.iter().filter(|p| p.pid != me && p.name.to_lowercase().contains(&f)).map(|p| p.pid).collect();
+                    if pids.is_empty() {
+                        ui.say(format!("{} «{}»", l("Ningún proceso se llama", "No process is named"), self.filter));
+                    } else {
+                        self.kill = Some((pids, format!("«{}»", self.filter)));
+                    }
+                }
+            }
+            KeyCode::Char('v') if self.gpu.is_some() => self.gpu_view = !self.gpu_view,
             _ => return false,
         }
         true
     }
 
-    fn scroll(&mut self, down: bool, _ui: &mut Ui) {
-        self.move_sel(if down { 3 } else { -3 });
+    fn scroll(&mut self, x: u16, y: u16, down: bool, _ui: &mut Ui) {
+        if self.hits.gpu.contains(Position { x, y }) {
+            let max = self.gpu_procs.len().saturating_sub(1);
+            self.gpu_top = if down { (self.gpu_top + 1).min(max) } else { self.gpu_top.saturating_sub(1) };
+        } else {
+            self.move_sel(if down { 3 } else { -3 });
+        }
+    }
+
+    fn click(&mut self, x: u16, y: u16, b: MouseButton, double: bool, ui: &mut Ui) {
+        // con la pregunta de cerrar abierta, un clic en otro lado la cancela
+        if self.kill.take().is_some() {
+            return;
+        }
+        self.typing = false;
+        if let Some(&(_, pid)) = self.hits.gpu_rows.iter().find(|r| r.0 == y && self.hits.gpu.contains(Position { x, y })) {
+            self.select_pid(pid);
+            if double || b == MouseButton::Right {
+                self.press(KeyCode::Char('x'), ui);
+            }
+            return;
+        }
+        if !self.hits.procs.contains(Position { x, y }) {
+            return;
+        }
+        if y == self.hits.head {
+            if (self.hits.cpu_col.0..self.hits.cpu_col.1).contains(&x) {
+                self.press(KeyCode::Char('c'), ui);
+            } else if (self.hits.mem_col.0..self.hits.mem_col.1).contains(&x) {
+                self.press(KeyCode::Char('m'), ui);
+            }
+            return;
+        }
+        let Some(&(_, i)) = self.hits.rows.iter().find(|r| r.0 == y) else { return };
+        self.sel = i;
+        self.follow = true;
+        if double || b == MouseButton::Right {
+            self.press(KeyCode::Char('x'), ui);
+        }
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         if self.typing {
             return vec![("enter", l("listo", "done")), ("esc", l("borrar", "clear"))];
         }
+        if self.kill.is_some() {
+            return vec![("k", l("cerrar", "kill")), ("K", l("forzar", "force")), ("esc", l("no", "no"))];
+        }
         let mut v = vec![
             ("j/k", l("mover", "move")),
             ("c/m", l("ordenar cpu/mem", "sort cpu/mem")),
+            ("a", if self.group { l("desagrupar", "ungroup") } else { l("agrupar", "group") }),
             ("/", l("buscar", "search")),
             ("x", l("cerrar proceso", "kill")),
         ];
         if !self.filter.is_empty() {
+            v.push(("X", l("cerrar por nombre", "pkill name")));
             v.push(("esc", l("quitar búsqueda", "clear search")));
+        }
+        if self.gpu.is_some() && !self.hits.procs.is_empty() && self.hits.gpu.is_empty() || self.gpu_view {
+            v.push(("v", if self.gpu_view { l("procesos", "processes") } else { l("gpu", "gpu") }));
         }
         v
     }

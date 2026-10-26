@@ -10,6 +10,7 @@ ratatui = "0.29"
 serde_json = "1"
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 libc = "0.2"
+async-io = "2"
 
 [profile.release]
 lto = true

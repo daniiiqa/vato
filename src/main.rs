@@ -5,6 +5,10 @@
 //!
 //! Con vato ya abierto, escribir la pestaña en $XDG_RUNTIME_DIR/vato.tab
 //! la cambia (así la barra de discada reusa la ventana).
+//!
+//! El ratón, como en rola: clic en una pestaña o en una tecla de abajo hace
+//! lo mismo que la tecla; en las listas, clic elige, doble clic es enter,
+//! clic derecho la otra acción de la fila, y la rueda va donde esté el puntero.
 
 mod audio;
 mod bluetooth;
@@ -13,7 +17,7 @@ mod network;
 mod system;
 
 use look::Look;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
@@ -67,7 +71,33 @@ pub trait Tab {
     fn typing(&self) -> bool {
         false
     }
-    fn scroll(&mut self, _down: bool, _ui: &mut Ui) {}
+    /// la rueda en (x, y)
+    fn scroll(&mut self, _x: u16, _y: u16, _down: bool, _ui: &mut Ui) {}
+    /// un clic en (x, y) dentro de la pestaña
+    fn click(&mut self, _x: u16, _y: u16, _b: MouseButton, _double: bool, _ui: &mut Ui) {}
+    /// arrastrando con el botón izquierdo
+    fn drag(&mut self, _x: u16, _y: u16, _ui: &mut Ui) {}
+    /// algo pide atención (bluetooth preguntando al emparejar): ir a esta pestaña
+    fn wants_focus(&mut self) -> bool {
+        false
+    }
+}
+
+/// Lo que hay bajo un clic en las líneas de arriba y abajo.
+enum Hit {
+    Tab(usize),
+    Key(KeyCode),
+}
+
+/// "enter" → Enter, "x" → x; las de dos teclas ("j/k") no son botón.
+fn hint_key(k: &str) -> Option<KeyCode> {
+    match k {
+        "enter" => Some(KeyCode::Enter),
+        "esc" => Some(KeyCode::Esc),
+        "tab" => Some(KeyCode::Tab),
+        _ if k.chars().count() == 1 => k.chars().next().map(KeyCode::Char),
+        _ => None,
+    }
 }
 
 struct App {
@@ -75,6 +105,9 @@ struct App {
     cur: usize,
     ui: Ui,
     quit: bool,
+    hits: Vec<(Rect, Hit)>,
+    body: Rect,
+    last_click: Option<(Instant, u16, u16)>,
 }
 
 impl App {
@@ -85,7 +118,10 @@ impl App {
         }
         let [head, body, foot] =
             Layout::vertical([Constraint::Length(1), Constraint::Fill(1), Constraint::Length(1)]).areas(f.area());
+        self.hits.clear();
+        self.body = body;
         // pestañas
+        let mut x = head.x + self.ui.look.tx("vato").chars().count() as u16 + 4;
         let mut spans = vec![
             Span::styled(format!(" {} ", self.ui.look.tx("vato")), Style::new().fg(t.base).bg(t.primary).bold()),
             Span::raw("  "),
@@ -93,7 +129,11 @@ impl App {
         for (i, tab) in self.tabs.iter().enumerate() {
             let name = self.ui.look.tx(tab.name());
             let st = if i == self.cur { Style::new().fg(t.primary).bold().underlined() } else { Style::new().fg(t.muted) };
-            spans.push(Span::styled(format!("{} {}", i + 1, name), st));
+            let label = format!("{} {}", i + 1, name);
+            let w = label.chars().count() as u16;
+            self.hits.push((Rect { x, y: head.y, width: w, height: 1 }, Hit::Tab(i)));
+            x += w + 3;
+            spans.push(Span::styled(label, st));
             spans.push(Span::raw("   "));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), head);
@@ -110,14 +150,49 @@ impl App {
                 let mut v = Vec::new();
                 let mut hints = self.tabs[cur].hints();
                 hints.extend([("tab", l("pestaña", "tab")), ("q", l("salir", "quit"))]);
+                let mut x = foot.x;
                 for (k, what) in hints {
-                    v.push(Span::styled(format!(" {k} "), Style::new().fg(t.primary).bold()));
-                    v.push(Span::styled(format!("{}  ", self.ui.look.tx(what)), Style::new().fg(t.muted)));
+                    let key = format!(" {k} ");
+                    let what = format!("{}  ", self.ui.look.tx(what));
+                    let w = (key.chars().count() + what.chars().count()) as u16;
+                    if let Some(code) = hint_key(k) {
+                        self.hits.push((Rect { x, y: foot.y, width: w.saturating_sub(1), height: 1 }, Hit::Key(code)));
+                    }
+                    x += w;
+                    v.push(Span::styled(key, Style::new().fg(t.primary).bold()));
+                    v.push(Span::styled(what, Style::new().fg(t.muted)));
                 }
                 Line::from(v)
             }
         };
         f.render_widget(Paragraph::new(line), foot);
+    }
+
+    fn mouse(&mut self, m: MouseEvent) {
+        let (x, y) = (m.column, m.row);
+        let cur = self.cur;
+        let in_body = self.body.contains(ratatui::layout::Position { x, y });
+        match m.kind {
+            MouseEventKind::ScrollDown if in_body => self.tabs[cur].scroll(x, y, true, &mut self.ui),
+            MouseEventKind::ScrollUp if in_body => self.tabs[cur].scroll(x, y, false, &mut self.ui),
+            MouseEventKind::Drag(MouseButton::Left) if in_body => self.tabs[cur].drag(x, y, &mut self.ui),
+            MouseEventKind::Down(b) => {
+                let double = self.last_click.is_some_and(|(t, cx, cy)| t.elapsed() < Duration::from_millis(400) && cy == y && cx.abs_diff(x) < 3);
+                self.last_click = Some((Instant::now(), x, y));
+                if in_body {
+                    return self.tabs[cur].click(x, y, b, double, &mut self.ui);
+                }
+                match self.hits.iter().find(|(r, _)| r.contains(ratatui::layout::Position { x, y })).map(|h| &h.1) {
+                    Some(Hit::Tab(i)) if !self.tabs[cur].typing() => self.cur = *i,
+                    Some(Hit::Key(code)) => {
+                        let code = *code;
+                        self.key(KeyEvent::new(code, KeyModifiers::NONE));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
     }
 
     fn key(&mut self, k: KeyEvent) {
@@ -183,6 +258,9 @@ fn main() {
         cur,
         ui: Ui { look: Look::load(), status: None },
         quit: false,
+        hits: Vec::new(),
+        body: Rect::default(),
+        last_click: None,
     };
 
     let mut term = ratatui::init();
@@ -205,17 +283,16 @@ fn main() {
                 }
             }
         }
+        if let Some(i) = app.tabs.iter_mut().position(|t| t.wants_focus()) {
+            app.cur = i;
+        }
         let cur = app.cur;
         app.tabs[cur].tick(&mut app.ui);
         let _ = term.draw(|f| app.draw(f));
         if event::poll(Duration::from_millis(150)).unwrap_or(false) {
             match event::read() {
                 Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => app.key(k),
-                Ok(Event::Mouse(m)) => match m.kind {
-                    MouseEventKind::ScrollDown => app.tabs[cur].scroll(true, &mut app.ui),
-                    MouseEventKind::ScrollUp => app.tabs[cur].scroll(false, &mut app.ui),
-                    _ => {}
-                },
+                Ok(Event::Mouse(m)) => app.mouse(m),
                 _ => {}
             }
         }

@@ -18,13 +18,21 @@ vato system       (o sys)
 
 | pestaña | qué hace | de dónde |
 |---|---|---|
-| **audio** | salidas, entradas, el volumen de cada app y quién usa el micrófono; predeterminada, mudo, mandar una app a otra salida o entrada | PipeWire (`pactl`) |
-| **bluetooth** | emparejados y cercanos, conectar, emparejar, confianza, olvidar, batería | BlueZ por D-Bus (vato es su propio agente para emparejar) |
+| **audio** | salidas, entradas, el volumen de cada app y quién usa el micrófono; predeterminada, mudo, mandar una app a otra salida o entrada, puerto y perfil de la tarjeta (`p`) | PipeWire (`pactl`) |
+| **bluetooth** | emparejados y cercanos, conectar, emparejar, confianza, olvidar, batería | BlueZ por D-Bus (vato es su propio agente: lo que pregunte un dispositivo al emparejar sale aquí y nada se acepta solo) |
 | **network** | cable, wifi y VPN (las guardadas también, para prenderlas); redes cerca con señal, conectar con contraseña, olvidar, wifi on/off | NetworkManager (`nmcli`) |
-| **system** | CPU por núcleo y gráfica, GPU (AMD), VRAM, RAM, swap, discos, red, temperaturas, procesos (buscar con `/`, cerrar con `x`) | `/proc` y `/sys` |
+| **system** | CPU por núcleo y gráfica; GPU con reloj, consumo, ventilador, temperaturas y qué procesos la usan (gráficos, video, VRAM); RAM, swap, discos, red; procesos (buscar con `/`, agrupar con `a`, cerrar con `x`, cerrar por nombre como pkill con `X`) | `/proc`, `/sys` y el fdinfo de DRM (AMD; por proceso también Intel) |
 
 Teclas: `1`–`4` o `tab` cambian de pestaña, `j`/`k` se mueven, `enter` hace
 lo obvio de cada fila; la línea de abajo dice el resto. `q` sale.
+
+Ratón, como en rola: clic en una pestaña o en una tecla de la línea de abajo
+hace lo mismo que la tecla; en las listas, clic elige, doble clic es `enter` y
+clic derecho la otra acción (audio: mudo; bluetooth: confianza; red: olvidar;
+procesos: cerrar). En audio, clic o arrastrar sobre la barra pone el volumen,
+la rueda sobre una fila le sube o baja, y clic medio abre puerto/perfil. En
+sistema, clic en `cpu` o `mem` ordena y clic en un proceso de la GPU lo busca
+en la lista.
 
 ## Instalar
 

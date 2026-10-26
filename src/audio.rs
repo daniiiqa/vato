@@ -1,13 +1,16 @@
 //! Audio: salidas, entradas, el volumen de cada app y las que están usando
-//! un micrófono (PipeWire vía pactl).
+//! un micrófono (PipeWire vía pactl). `p` abre el puerto y el perfil de la
+//! tarjeta (bocinas o audífonos, HDMI 1 o 2, bluetooth en calidad alta o con
+//! micrófono).
 //! `pactl subscribe` avisa de cualquier cambio y la lista se relee sola.
 
 use crate::{Tab, Ui, l};
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
+use ratatui::layout::Position;
 use ratatui::layout::Rect;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 use serde_json::Value;
 use std::process::{Command, Stdio};
@@ -35,6 +38,23 @@ struct Node {
     vol: u32,
     mute: bool,
     default: bool,
+    card: String, // la tarjeta (device.name) de una salida o entrada
+    ports: Vec<(String, String, bool)>, // nombre, descripción, conectado
+    port: String,
+}
+
+struct Card {
+    name: String,
+    label: String,
+    active: String,
+    profiles: Vec<(String, String, bool, u64)>, // nombre, descripción, disponible, prioridad
+}
+
+#[derive(Clone)]
+enum Pick {
+    Head(String),
+    Port { sink: bool, node: String, port: String, label: String, active: bool, ok: bool },
+    Profile { card: String, profile: String, label: String, active: bool, ok: bool },
 }
 
 pub struct Audio {
@@ -43,6 +63,34 @@ pub struct Audio {
     dirty: Arc<AtomicBool>,
     last: Instant,
     want_inputs: bool,
+    cards: Vec<Card>,
+    /// el menú de puertos y perfiles abierto: opciones y cuál está elegida
+    pick: Option<(Vec<Pick>, usize)>,
+    // dónde quedó cada cosa al dibujar (para el ratón)
+    rows: Vec<(u16, usize)>, // fila de pantalla → nodo
+    bar: (u16, u16),         // x y ancho de las barras de volumen
+    pop: Rect,
+    pop_rows: Vec<(u16, usize)>, // fila de pantalla → opción del menú
+}
+
+fn ports(s: &Value) -> (Vec<(String, String, bool)>, String) {
+    let ports = s["ports"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            (
+                p["name"].as_str().unwrap_or("").to_string(),
+                p["description"].as_str().unwrap_or("").to_string(),
+                p["availability"].as_str() != Some("not available"),
+            )
+        })
+        .collect();
+    (ports, s["active_port"].as_str().unwrap_or("").to_string())
+}
+
+fn card_of(s: &Value) -> String {
+    s["properties"]["device.name"].as_str().unwrap_or("").to_string()
 }
 
 fn pactl(args: &[&str]) -> Option<Value> {
@@ -99,7 +147,13 @@ impl Audio {
                 std::thread::sleep(Duration::from_secs(2));
             }
         });
-        Audio { nodes: Vec::new(), sel: 0, dirty, last: Instant::now(), want_inputs: false }
+        Audio { nodes: Vec::new(), sel: 0, dirty, last: Instant::now(), want_inputs: false, cards: Vec::new(),
+            pick: None,
+            rows: Vec::new(),
+            bar: (0, 0),
+            pop: Rect::default(),
+            pop_rows: Vec::new(),
+        }
     }
 
     /// `vato mic`: empezar en las entradas
@@ -122,7 +176,11 @@ impl Audio {
         };
         for s in sinks.as_array().into_iter().flatten() {
             let name = s["name"].as_str().unwrap_or("").to_string();
+            let (ports, port) = ports(s);
             nodes.push(Node {
+                card: card_of(s),
+                ports,
+                port,
                 kind: Kind::Out,
                 index: s["index"].as_u64().unwrap_or(0) as u32,
                 default: name == def_out,
@@ -139,7 +197,11 @@ impl Audio {
             if name.ends_with(".monitor") || !s["monitor_of_sink"].is_null() && s["monitor_of_sink"] != "n/a" {
                 continue;
             }
+            let (ports, port) = ports(s);
             nodes.push(Node {
+                card: card_of(s),
+                ports,
+                port,
                 kind: Kind::In,
                 index: s["index"].as_u64().unwrap_or(0) as u32,
                 default: name == def_in,
@@ -155,6 +217,9 @@ impl Audio {
             let app = p["application.name"].as_str().or(p["application.process.binary"].as_str()).unwrap_or("?");
             let media = p["media.name"].as_str().unwrap_or("");
             nodes.push(Node {
+                card: String::new(),
+                ports: Vec::new(),
+                port: String::new(),
                 kind: Kind::App,
                 index: s["index"].as_u64().unwrap_or(0) as u32,
                 name: String::new(),
@@ -175,6 +240,9 @@ impl Audio {
             }
             let app = p["application.name"].as_str().or(p["application.process.binary"].as_str()).unwrap_or("?");
             nodes.push(Node {
+                card: String::new(),
+                ports: Vec::new(),
+                port: String::new(),
                 kind: Kind::Rec,
                 index: s["index"].as_u64().unwrap_or(0) as u32,
                 name: String::new(),
@@ -185,6 +253,34 @@ impl Audio {
                 default: false,
             });
         }
+        self.cards = pactl(&["list", "cards"])
+            .unwrap_or(Value::Null)
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| {
+                let mut profiles: Vec<(String, String, bool, u64)> = c["profiles"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            v["description"].as_str().unwrap_or(k).to_string(),
+                            v["available"].as_bool().unwrap_or(true),
+                            v["priority"].as_u64().unwrap_or(0),
+                        )
+                    })
+                    .collect();
+                profiles.sort_by_key(|p| std::cmp::Reverse(p.3));
+                Card {
+                    name: c["name"].as_str().unwrap_or("").to_string(),
+                    label: c["properties"]["device.description"].as_str().unwrap_or("").to_string(),
+                    active: c["active_profile"].as_str().unwrap_or("").to_string(),
+                    profiles,
+                }
+            })
+            .collect();
         let first = self.nodes.is_empty();
         self.nodes = nodes;
         // al abrir: en la salida predeterminada (o en la entrada con `vato mic`)
@@ -250,6 +346,98 @@ impl Audio {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
+    /// Opciones para la salida o entrada elegida: sus puertos (si hay más de
+    /// uno) y los perfiles de su tarjeta. "Apagada" no: la tarjeta
+    /// desaparecería de la lista y no habría cómo volver a prenderla aquí.
+    fn options(&self) -> Vec<Pick> {
+        let Some(n) = self.nodes.get(self.sel) else { return Vec::new() };
+        if !matches!(n.kind, Kind::Out | Kind::In) {
+            return Vec::new();
+        }
+        let mut v = Vec::new();
+        if n.ports.len() > 1 {
+            v.push(Pick::Head(l("puerto", "port").to_string()));
+            for (name, desc, ok) in &n.ports {
+                v.push(Pick::Port {
+                    sink: n.kind == Kind::Out,
+                    node: n.name.clone(),
+                    port: name.clone(),
+                    label: desc.clone(),
+                    active: *name == n.port,
+                    ok: *ok,
+                });
+            }
+        }
+        if let Some(c) = self.cards.iter().find(|c| c.name == n.card) {
+            let profiles: Vec<_> = c.profiles.iter().filter(|p| p.0 != "off" && (p.2 || p.0 == c.active)).collect();
+            if profiles.len() > 1 {
+                v.push(Pick::Head(format!("{} · {}", l("perfil", "profile"), c.label)));
+                for (name, desc, ok, _) in profiles {
+                    v.push(Pick::Profile {
+                        card: c.name.clone(),
+                        profile: name.clone(),
+                        label: desc.clone(),
+                        active: *name == c.active,
+                        ok: *ok,
+                    });
+                }
+            }
+        }
+        v
+    }
+
+    fn open_pick(&mut self, ui: &mut Ui) {
+        let opts = self.options();
+        if opts.is_empty() {
+            ui.say(l("Esta no tiene otros puertos ni perfiles", "No other ports or profiles here"));
+            return;
+        }
+        let at = opts
+            .iter()
+            .position(|p| matches!(p, Pick::Port { active: true, .. } | Pick::Profile { active: true, .. }))
+            .or_else(|| opts.iter().position(|p| !matches!(p, Pick::Head(_))))
+            .unwrap_or(0);
+        self.pick = Some((opts, at));
+    }
+
+    fn apply_pick(&mut self, p: Pick, ui: &mut Ui) {
+        match p {
+            Pick::Port { sink, node, port, label, .. } => {
+                run(&[if sink { "set-sink-port" } else { "set-source-port" }, &node, &port]);
+                ui.say(format!("{}: {label}", l("Puerto", "Port")));
+            }
+            Pick::Profile { card, profile, label, .. } => {
+                run(&["set-card-profile", &card, &profile]);
+                ui.say(format!("{}: {label}", l("Perfil", "Profile")));
+            }
+            Pick::Head(_) => return,
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    fn press(&mut self, code: KeyCode, ui: &mut Ui) {
+        self.key(KeyEvent::new(code, KeyModifiers::NONE), ui);
+    }
+
+    fn row_at(&self, y: u16) -> Option<usize> {
+        self.rows.iter().find(|r| r.0 == y).map(|r| r.1)
+    }
+
+    /// clic o arrastre sobre la barra: el volumen a esa altura
+    fn volume_at(&mut self, x: u16) {
+        let (x0, w) = self.bar;
+        if w == 0 || x < x0 {
+            return;
+        }
+        let frac = ((x - x0) as f64 + 0.5) / w as f64;
+        let v = ((frac * 100.0).round() as u32).min(100);
+        if let Some(n) = self.nodes.get(self.sel).cloned() {
+            self.set_volume(&n, &format!("{v}%"));
+            self.nodes[self.sel].vol = v;
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
     fn nudge(&mut self, d: i32) {
         if let Some(n) = self.nodes.get(self.sel).cloned() {
             let v = (n.vol as i32 + d).clamp(0, MAX as i32) as u32;
@@ -298,6 +486,7 @@ impl Tab for Audio {
         let bar_w = (inner.width as usize / 4).clamp(10, 30);
         let mut lines: Vec<Line> = Vec::new();
         let mut sel_line = 0;
+        let mut node_lines = Vec::new();
         let mut last_kind = None;
         for (i, n) in self.nodes.iter().enumerate() {
             if last_kind != Some(n.kind) {
@@ -332,6 +521,7 @@ impl Tab for Audio {
             if selected {
                 sel_line = lines.len();
             }
+            node_lines.push((lines.len(), i));
             lines.push(Line::from(vec![
                 Span::styled(if selected { mark } else { " " }, Style::new().fg(t.primary)),
                 dot,
@@ -348,10 +538,96 @@ impl Tab for Audio {
         let h = inner.height as usize;
         let top = sel_line.saturating_sub(h.saturating_sub(2));
         f.render_widget(Paragraph::new(lines).scroll((top as u16, 0)), inner);
+        self.rows = node_lines
+            .into_iter()
+            .filter(|(li, _)| *li >= top && li - top < h)
+            .map(|(li, ni)| (inner.y + (li - top) as u16, ni))
+            .collect();
+        let label_w = (inner.width as usize).saturating_sub(bar_w + 16) as u16;
+        self.bar = (inner.x + 4 + label_w, bar_w as u16);
+        self.pop = Rect::default();
+        self.pop_rows.clear();
+
+        // el menú de puertos y perfiles, encima
+        if let Some((opts, at)) = &self.pick {
+            let w = (opts
+                .iter()
+                .map(|p| match p {
+                    Pick::Head(s) => s.chars().count(),
+                    Pick::Port { label, .. } | Pick::Profile { label, .. } => label.chars().count() + 4,
+                })
+                .max()
+                .unwrap_or(20)
+                + 6)
+            .clamp(30, area.width.saturating_sub(4) as usize) as u16;
+            let hgt = (opts.len() as u16 + 2).min(area.height.saturating_sub(2));
+            let r = Rect { x: area.x + (area.width.saturating_sub(w)) / 2, y: area.y + (area.height.saturating_sub(hgt)) / 2, width: w, height: hgt };
+            let block = look.block(true);
+            let inner = block.inner(r);
+            f.render_widget(Clear, r);
+            f.render_widget(block.style(Style::new().bg(t.bg)), r);
+            let (sel_style, mark) = look.sel(true);
+            let lines: Vec<Line> = opts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| match p {
+                    Pick::Head(s) => Line::styled(format!(" {}", look.tx(s)), Style::new().fg(t.muted).bold()),
+                    Pick::Port { label, active, ok, .. } | Pick::Profile { label, active, ok, .. } => {
+                        let st = if i == *at {
+                            sel_style
+                        } else {
+                            Style::new().fg(if *ok { t.fg } else { t.muted })
+                        };
+                        let pad = (inner.width as usize).saturating_sub(label.chars().count() + 3);
+                        Line::from(vec![
+                            Span::styled(if i == *at { mark } else { " " }, Style::new().fg(t.primary)),
+                            Span::styled(if *active { "● " } else { "  " }, Style::new().fg(t.primary)),
+                            Span::styled(format!("{label}{}", " ".repeat(pad)), st),
+                        ])
+                    }
+                })
+                .collect();
+            let top = at.saturating_sub(inner.height.saturating_sub(1) as usize);
+            f.render_widget(Paragraph::new(lines).scroll((top as u16, 0)), inner);
+            self.pop = r;
+            self.pop_rows = (top..opts.len())
+                .take(inner.height as usize)
+                .enumerate()
+                .map(|(k, i)| (inner.y + k as u16, i))
+                .collect();
+        }
     }
 
     fn key(&mut self, k: KeyEvent, ui: &mut Ui) -> bool {
+        if let Some((opts, mut at)) = self.pick.take() {
+            let step = |at: usize, down: bool| -> usize {
+                let mut i = at;
+                loop {
+                    let next = if down { i + 1 } else { i.wrapping_sub(1) };
+                    match opts.get(next) {
+                        Some(Pick::Head(_)) => i = next,
+                        Some(_) => return next,
+                        None => return at,
+                    }
+                }
+            };
+            match k.code {
+                KeyCode::Down | KeyCode::Char('j') => at = step(at, true),
+                KeyCode::Up | KeyCode::Char('k') => at = step(at, false),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Some(p) = opts.get(at).cloned() {
+                        self.apply_pick(p, ui);
+                    }
+                    return true;
+                }
+                KeyCode::Esc | KeyCode::Char('p' | 'q') => return true,
+                _ => {}
+            }
+            self.pick = Some((opts, at));
+            return true;
+        }
         match k.code {
+            KeyCode::Char('p') => self.open_pick(ui),
             KeyCode::Down | KeyCode::Char('j') => self.sel = (self.sel + 1).min(self.nodes.len().saturating_sub(1)),
             KeyCode::Up | KeyCode::Char('k') => self.sel = self.sel.saturating_sub(1),
             KeyCode::Right | KeyCode::Char('l') => self.nudge(5),
@@ -371,8 +647,48 @@ impl Tab for Audio {
         true
     }
 
-    fn scroll(&mut self, down: bool, _ui: &mut Ui) {
+    fn scroll(&mut self, _x: u16, y: u16, down: bool, ui: &mut Ui) {
+        if self.pick.is_some() {
+            return self.press(if down { KeyCode::Down } else { KeyCode::Up }, ui);
+        }
+        // la rueda sobre una fila le mueve el volumen a esa
+        if let Some(i) = self.row_at(y) {
+            self.sel = i;
+        }
         self.nudge(if down { -5 } else { 5 });
+    }
+
+    fn click(&mut self, x: u16, y: u16, b: MouseButton, double: bool, ui: &mut Ui) {
+        if let Some((opts, _)) = &self.pick {
+            // fuera del menú lo cierra; en una opción, la usa
+            if !self.pop.contains(Position { x, y }) {
+                self.pick = None;
+                return;
+            }
+            if let Some(i) = self.pop_rows.iter().find(|r| r.0 == y).map(|r| r.1) {
+                if !matches!(opts.get(i), Some(Pick::Head(_))) {
+                    self.pick.as_mut().unwrap().1 = i;
+                    self.press(KeyCode::Enter, ui);
+                }
+            }
+            return;
+        }
+        let Some(i) = self.row_at(y) else { return };
+        self.sel = i;
+        let on_bar = x >= self.bar.0 && x < self.bar.0 + self.bar.1;
+        match b {
+            MouseButton::Left if on_bar => self.volume_at(x),
+            MouseButton::Left if double => self.press(KeyCode::Enter, ui),
+            MouseButton::Right => self.mute(),
+            MouseButton::Middle => self.open_pick(ui),
+            _ => {}
+        }
+    }
+
+    fn drag(&mut self, x: u16, _y: u16, _ui: &mut Ui) {
+        if self.pick.is_none() {
+            self.volume_at(x.clamp(self.bar.0, self.bar.0 + self.bar.1.saturating_sub(1)));
+        }
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
@@ -381,6 +697,13 @@ impl Tab for Audio {
             Some(Kind::Rec) => l("cambiar entrada", "move input"),
             _ => l("predeterminada", "make default"),
         };
-        vec![("j/k", l("mover", "move")), ("h/l", l("volumen", "volume")), ("m", l("mudo", "mute")), ("enter", enter), ("0", "100%")]
+        if self.pick.is_some() {
+            return vec![("j/k", l("mover", "move")), ("enter", l("usar", "use")), ("esc", l("cerrar", "close"))];
+        }
+        let mut v = vec![("j/k", l("mover", "move")), ("h/l", l("volumen", "volume")), ("m", l("mudo", "mute")), ("enter", enter), ("0", "100%")];
+        if matches!(self.nodes.get(self.sel).map(|n| n.kind), Some(Kind::Out | Kind::In)) {
+            v.push(("p", l("puerto/perfil", "port/profile")));
+        }
+        v
     }
 }

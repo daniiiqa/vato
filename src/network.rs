@@ -3,7 +3,7 @@
 //! tarda (escanear, conectar) va en otro hilo.
 
 use crate::{Tab, Ui, l};
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton};
 use ratatui::layout::Rect;
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -67,6 +67,7 @@ pub struct Network {
     forget: Option<(String, String)>,
     /// desconectar pide un segundo enter (para no quedarse sin internet sin querer)
     confirm_down: Option<String>,
+    rows_at: Vec<(u16, usize)>, // fila de pantalla → fila de la lista (para el ratón)
 }
 
 fn nmcli(args: &[&str]) -> Result<String, String> {
@@ -78,6 +79,67 @@ fn nmcli(args: &[&str]) -> Result<String, String> {
         let err = String::from_utf8_lossy(&out.stderr);
         Err(err.lines().rfind(|l| !l.starts_with("Warning")).unwrap_or("nmcli").trim_start_matches("Error: ").to_string())
     }
+}
+
+const NM: &str = "org.freedesktop.NetworkManager";
+
+/// Conectar a una red nueva con contraseña hablándole a NetworkManager por
+/// D-Bus: con nmcli la contraseña va en la línea de comando y cualquiera la ve
+/// en `ps`. NetworkManager completa el tipo de seguridad (WPA2, WPA3) con el
+/// punto de acceso. Si no conecta, el perfil a medias se borra.
+fn connect_secret(iface: &str, ssid: &str, password: &str) -> Result<(), String> {
+    use zbus::blocking::Connection;
+    use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+    let short = |e: zbus::Error| e.to_string().rsplit(": ").next().unwrap_or("").to_string();
+    let c = Connection::system().map_err(short)?;
+    let prop = |path: &OwnedObjectPath, iface: &str, name: &str| -> Option<OwnedValue> {
+        c.call_method(Some(NM), path.as_str(), Some("org.freedesktop.DBus.Properties"), "Get", &(iface, name))
+            .ok()?
+            .body()
+            .deserialize::<OwnedValue>()
+            .ok()
+    };
+    let dev: OwnedObjectPath = c
+        .call_method(Some(NM), "/org/freedesktop/NetworkManager", Some(NM), "GetDeviceByIpIface", &(iface,))
+        .and_then(|m| m.body().deserialize())
+        .map_err(short)?;
+    // el punto de acceso de esa red con más señal
+    let aps: Vec<OwnedObjectPath> = c
+        .call_method(Some(NM), dev.as_str(), Some("org.freedesktop.NetworkManager.Device.Wireless"), "GetAllAccessPoints", &())
+        .and_then(|m| m.body().deserialize())
+        .map_err(short)?;
+    let ap_iface = "org.freedesktop.NetworkManager.AccessPoint";
+    let ap = aps
+        .into_iter()
+        .filter(|ap| prop(ap, ap_iface, "Ssid").and_then(|v| Vec::<u8>::try_from(v).ok()).as_deref() == Some(ssid.as_bytes()))
+        .max_by_key(|ap| prop(ap, ap_iface, "Strength").and_then(|v| u8::try_from(v).ok()).unwrap_or(0))
+        .ok_or_else(|| l("la red ya no está a la vista", "the network is out of range").to_string())?;
+
+    let mut settings: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
+    settings.insert("connection", HashMap::from([("id", Value::from(ssid)), ("type", Value::from("802-11-wireless"))]));
+    settings.insert("802-11-wireless", HashMap::from([("ssid", Value::from(ssid.as_bytes().to_vec()))]));
+    settings.insert("802-11-wireless-security", HashMap::from([("psk", Value::from(password))]));
+    let (conn, active): (OwnedObjectPath, OwnedObjectPath) = c
+        .call_method(Some(NM), "/org/freedesktop/NetworkManager", Some(NM), "AddAndActivateConnection", &(settings, &dev, &ap))
+        .and_then(|m| m.body().deserialize())
+        .map_err(short)?;
+
+    // esperar: 2 = conectada; 4 = se cayó, o el objeto desaparece
+    let start = Instant::now();
+    let ok = loop {
+        std::thread::sleep(Duration::from_millis(300));
+        match prop(&active, "org.freedesktop.NetworkManager.Connection.Active", "State").and_then(|v| u32::try_from(v).ok()) {
+            Some(2) => break true,
+            Some(4) | None => break false,
+            _ if start.elapsed() > Duration::from_secs(45) => break false,
+            _ => {}
+        }
+    };
+    if ok {
+        return Ok(());
+    }
+    let _ = c.call_method(Some(NM), conn.as_str(), Some("org.freedesktop.NetworkManager.Settings.Connection"), "Delete", &());
+    Err(l("no conectó (¿contraseña mala?)", "couldn't connect (wrong password?)").to_string())
 }
 
 /// Campos de `nmcli -t`: separados por ':' y con '\:' para los dos puntos de adentro.
@@ -115,7 +177,12 @@ impl Network {
             pass: None,
             forget: None,
             confirm_down: None,
+            rows_at: Vec::new(),
         }
+    }
+
+    fn press(&mut self, code: KeyCode, ui: &mut Ui) {
+        self.key(KeyEvent::new(code, KeyModifiers::NONE), ui);
     }
 
     fn rows(&self) -> Vec<Row> {
@@ -226,12 +293,13 @@ impl Network {
     /// Una red sin perfil: nmcli lo crea al conectar, y si falla (contraseña
     /// mala) lo deja guardado y ya no la vuelve a pedir; ese se borra.
     fn connect_wifi(&mut self, ssid: String, password: Option<String>) {
+        let iface = self.devs.iter().find(|d| d.kind == "wifi").map(|d| d.name.clone()).unwrap_or_default();
         self.spawn(format!("{} {ssid}…", l("Conectando a", "Connecting to")), move || {
-            let mut args = vec!["device", "wifi", "connect", ssid.as_str()];
-            if let Some(p) = &password {
-                args.extend(["password", p.as_str()]);
+            let done = format!("{}: {ssid}", l("Conectado", "Connected"));
+            if let Some(p) = password {
+                return connect_secret(&iface, &ssid, &p).map(|_| done);
             }
-            nmcli(&args).map(|_| format!("{}: {ssid}", l("Conectado", "Connected"))).inspect_err(|_| {
+            nmcli(&["device", "wifi", "connect", &ssid]).map(|_| done).inspect_err(|_| {
                 let _ = nmcli(&["connection", "delete", "id", &ssid]);
             })
         });
@@ -333,12 +401,14 @@ impl Tab for Network {
         ]));
         let (sel_style, mark) = look.sel(true);
         let mut sel_line = 0;
+        let mut item_lines = Vec::new();
         let w = inner.width as usize;
         for (i, d) in self.devs.iter().enumerate() {
             let selected = i == self.sel;
             if selected {
                 sel_line = lines.len();
             }
+            item_lines.push((lines.len(), i));
             let up = d.state.starts_with("connected");
             let icon = match d.kind.as_str() {
                 "ethernet" => "\u{f0200}",
@@ -365,6 +435,7 @@ impl Tab for Network {
             if selected {
                 sel_line = lines.len();
             }
+            item_lines.push((lines.len(), self.devs.len() + j));
             let name: String = format!("\u{f0582} {}", v.name).chars().take(w.saturating_sub(22)).collect();
             let pad = w.saturating_sub(22 + name.chars().count());
             let state = if v.active { l("conectada", "connected") } else { "" };
@@ -391,6 +462,7 @@ impl Tab for Network {
             if selected {
                 sel_line = lines.len();
             }
+            item_lines.push((lines.len(), base + j));
             let bars: String = (0..4)
                 .map(|k| if wf.signal as usize > k * 25 { lv[(k * 2 + 1).min(lv.len() - 1)] } else { ' ' })
                 .collect();
@@ -434,6 +506,11 @@ impl Tab for Network {
         let h = inner.height as usize;
         let top = sel_line.saturating_sub(h.saturating_sub(4));
         f.render_widget(Paragraph::new(lines).scroll((top as u16, 0)), inner);
+        self.rows_at = item_lines
+            .into_iter()
+            .filter(|(li, _)| *li >= top && li - top < h)
+            .map(|(li, i)| (inner.y + (li - top) as u16, i))
+            .collect();
     }
 
     fn key(&mut self, k: KeyEvent, _ui: &mut Ui) -> bool {
@@ -492,6 +569,15 @@ impl Tab for Network {
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
+        if self.pass.is_some() {
+            return vec![("enter", l("conectar", "connect")), ("tab", l("mostrar", "show")), ("esc", l("cancelar", "cancel"))];
+        }
+        if self.forget.is_some() {
+            return vec![("f", l("olvidar", "forget")), ("esc", l("no", "no"))];
+        }
+        if self.confirm_down.is_some() {
+            return vec![("enter", l("desconectar", "disconnect")), ("esc", l("no", "no"))];
+        }
         let enter = match self.rows().get(self.sel) {
             Some(Row::Dev(d)) if d.state.starts_with("connected") => l("desconectar", "disconnect"),
             Some(Row::Wifi(w)) if w.active => l("desconectar", "disconnect"),
@@ -512,7 +598,23 @@ impl Tab for Network {
         v
     }
 
-    fn scroll(&mut self, down: bool, _ui: &mut Ui) {
+    fn click(&mut self, _x: u16, y: u16, b: MouseButton, double: bool, ui: &mut Ui) {
+        if self.pass.is_some() || self.forget.is_some() {
+            return;
+        }
+        let Some(i) = self.rows_at.iter().find(|r| r.0 == y).map(|r| r.1) else { return };
+        if self.sel != i {
+            self.confirm_down = None;
+        }
+        self.sel = i;
+        match b {
+            MouseButton::Left if double => self.press(KeyCode::Enter, ui),
+            MouseButton::Right => self.press(KeyCode::Char('f'), ui),
+            _ => {}
+        }
+    }
+
+    fn scroll(&mut self, _x: u16, _y: u16, down: bool, _ui: &mut Ui) {
         if self.pass.is_none() {
             self.sel = if down { (self.sel + 1).min(self.rows().len().saturating_sub(1)) } else { self.sel.saturating_sub(1) };
         }
