@@ -2,6 +2,9 @@
 //! terminal, con el look de discada (como rola).
 //!
 //!   vato [audio|mic|bluetooth|network|wifi|system]
+//!
+//! Con vato ya abierto, escribir la pestaña en $XDG_RUNTIME_DIR/vato.tab
+//! la cambia (así la barra de discada reusa la ventana).
 
 mod audio;
 mod bluetooth;
@@ -143,6 +146,22 @@ impl App {
     }
 }
 
+/// `vato <pestaña>` con vato ya abierto (lo hace Tui.sh de discada): se
+/// escribe aquí y la ventana abierta se cambia a esa pestaña.
+fn tab_file() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into())).join("vato.tab")
+}
+
+fn tab_index(arg: &str) -> Option<usize> {
+    match arg {
+        "audio" | "mic" | "" => Some(0),
+        "bluetooth" | "bt" => Some(1),
+        "network" | "wifi" | "net" => Some(2),
+        "system" | "sys" => Some(3),
+        _ => None,
+    }
+}
+
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
     if arg == "-h" || arg == "--help" {
@@ -150,16 +169,10 @@ fn main() {
         return;
     }
     let mut audio = audio::Audio::new();
-    let cur = match arg.as_str() {
-        "bluetooth" | "bt" => 1,
-        "network" | "wifi" | "net" => 2,
-        "system" | "sys" => 3,
-        "mic" => {
-            audio.focus_inputs();
-            0
-        }
-        _ => 0,
-    };
+    if arg == "mic" {
+        audio.focus_inputs();
+    }
+    let cur = tab_index(&arg).unwrap_or(0);
     let mut app = App {
         tabs: vec![
             Box::new(audio),
@@ -175,10 +188,22 @@ fn main() {
     let mut term = ratatui::init();
     let _ = execute!(std::io::stdout(), event::EnableMouseCapture);
     let mut last_look = Instant::now();
+    let tab_mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut tab_seen = tab_mtime(&tab_file());
     while !app.quit {
         if last_look.elapsed() > Duration::from_secs(1) {
             app.ui.look.refresh();
             last_look = Instant::now();
+        }
+        // otra pestaña pedida desde fuera (la barra de discada)
+        let m = tab_mtime(&tab_file());
+        if m != tab_seen {
+            tab_seen = m;
+            if let Ok(want) = std::fs::read_to_string(tab_file()) {
+                if let Some(i) = tab_index(want.trim()) {
+                    app.cur = i;
+                }
+            }
         }
         let cur = app.cur;
         app.tabs[cur].tick(&mut app.ui);
