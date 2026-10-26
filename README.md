@@ -1,7 +1,8 @@
 # vato
 
 *Vato*: el compa que le sabe a todo y anda en todo el pedo. Escribes `vato`
-en la terminal y te resuelve el audio, el bluetooth, la red y el sistema.
+en la terminal y te resuelve el audio, el bluetooth, la red, el sistema y las
+notificaciones.
 
 Parte de [discada](https://github.com/daniiiqa/dotfiles), hermano de
 [rola](https://github.com/daniiiqa/rola): mismo look en cada estilo del rice
@@ -14,6 +15,7 @@ vato mic          audio, en las entradas
 vato bluetooth    (o bt)
 vato network      (o wifi)
 vato system       (o sys)
+vato notifications  (o notif)
 ```
 
 | pestaña | qué hace | de dónde |
@@ -22,8 +24,9 @@ vato system       (o sys)
 | **bluetooth** | emparejados y cercanos, conectar, emparejar, confianza, olvidar, batería | BlueZ por D-Bus (vato es su propio agente: lo que pregunte un dispositivo al emparejar sale aquí y nada se acepta solo) |
 | **network** | cable, wifi y VPN (las guardadas también, para prenderlas); redes cerca con señal, conectar con contraseña, olvidar, wifi on/off | NetworkManager (`nmcli`) |
 | **system** | CPU por núcleo y gráfica; GPU con reloj, consumo, ventilador, temperaturas y qué procesos la usan (gráficos, video, VRAM); RAM, swap, discos, red; procesos (buscar con `/`, agrupar con `a`, cerrar con `x`, cerrar por nombre como pkill con `X`) | `/proc`, `/sys` y el fdinfo de DRM (AMD; por proceso también Intel) |
+| **notifications** | el historial de [arre](https://github.com/daniiiqa/arre): abrir lo que pide cada una, quitarlas, borrar todas, no molestar y dónde salen | arre por D-Bus |
 
-Teclas: `1`–`4` o `tab` cambian de pestaña, `j`/`k` se mueven, `enter` hace
+Teclas: `1`–`5` o `tab` cambian de pestaña, `j`/`k` se mueven, `enter` hace
 lo obvio de cada fila; la línea de abajo dice el resto. `q` sale.
 
 Ratón, como en rola: clic en una pestaña o en una tecla de la línea de abajo

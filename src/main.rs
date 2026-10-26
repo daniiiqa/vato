@@ -1,7 +1,7 @@
-//! vato — el vato que le sabe a todo: audio, bluetooth, red y sistema en la
-//! terminal, con el look de discada (como rola).
+//! vato — el vato que le sabe a todo: audio, bluetooth, red, sistema y
+//! notificaciones en la terminal, con el look de discada (como rola).
 //!
-//!   vato [audio|mic|bluetooth|network|wifi|system]
+//!   vato [audio|mic|bluetooth|network|wifi|system|notifications]
 //!
 //! Con vato ya abierto, escribir la pestaña en $XDG_RUNTIME_DIR/vato.tab
 //! la cambia (así la barra de discada reusa la ventana).
@@ -14,6 +14,7 @@ mod audio;
 mod bluetooth;
 mod look;
 mod network;
+mod notifications;
 mod system;
 
 use look::Look;
@@ -233,6 +234,7 @@ fn tab_index(arg: &str) -> Option<usize> {
         "bluetooth" | "bt" => Some(1),
         "network" | "wifi" | "net" => Some(2),
         "system" | "sys" => Some(3),
+        "notifications" | "notif" | "notis" => Some(4),
         _ => None,
     }
 }
@@ -240,7 +242,7 @@ fn tab_index(arg: &str) -> Option<usize> {
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_default();
     if arg == "-h" || arg == "--help" {
-        println!("vato [audio|mic|bluetooth|network|wifi|system]");
+        println!("vato [audio|mic|bluetooth|network|wifi|system|notifications]");
         return;
     }
     let mut audio = audio::Audio::new();
@@ -254,6 +256,7 @@ fn main() {
             Box::new(bluetooth::Bluetooth::new()),
             Box::new(network::Network::new()),
             Box::new(system::System::new()),
+            Box::new(notifications::Notifications::new()),
         ],
         cur,
         ui: Ui { look: Look::load(), status: None },
