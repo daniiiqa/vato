@@ -18,10 +18,10 @@ vato system       (o sys)
 
 | pestaña | qué hace | de dónde |
 |---|---|---|
-| **audio** | salidas, entradas y el volumen de cada app; predeterminada, mudo, mandar una app a otra salida | PipeWire (`pactl`) |
+| **audio** | salidas, entradas, el volumen de cada app y quién usa el micrófono; predeterminada, mudo, mandar una app a otra salida o entrada | PipeWire (`pactl`) |
 | **bluetooth** | emparejados y cercanos, conectar, emparejar, confianza, olvidar, batería | BlueZ por D-Bus (vato es su propio agente para emparejar) |
-| **network** | cable, wifi y VPN; redes cerca con señal, conectar con contraseña, olvidar, wifi on/off | NetworkManager (`nmcli`) |
-| **system** | CPU por núcleo y gráfica, GPU (AMD), VRAM, RAM, swap, discos, red, temperaturas, procesos (cerrar con `x`) | `/proc` y `/sys` |
+| **network** | cable, wifi y VPN (las guardadas también, para prenderlas); redes cerca con señal, conectar con contraseña, olvidar, wifi on/off | NetworkManager (`nmcli`) |
+| **system** | CPU por núcleo y gráfica, GPU (AMD), VRAM, RAM, swap, discos, red, temperaturas, procesos (buscar con `/`, cerrar con `x`) | `/proc` y `/sys` |
 
 Teclas: `1`–`4` o `tab` cambian de pestaña, `j`/`k` se mueven, `enter` hace
 lo obvio de cada fila; la línea de abajo dice el resto. `q` sale.

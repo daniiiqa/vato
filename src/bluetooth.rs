@@ -85,9 +85,28 @@ fn set_prop(conn: &Connection, path: &str, iface: &str, prop: &str, v: bool) -> 
     .map_err(|e| short(&e.to_string()))
 }
 
-/// "org.bluez.Error.Failed: br-connection-page-timeout" → lo último
+/// "org.bluez.Error.Failed: br-connection-page-timeout" → algo que se entienda
 fn short(e: &str) -> String {
-    e.rsplit(": ").next().unwrap_or(e).to_string()
+    let last = e.rsplit(": ").next().unwrap_or(e);
+    let low = e.to_lowercase();
+    let human = if low.contains("page-timeout") || low.contains("host is down") || low.contains("connection-abort") {
+        l("no responde (¿está prendido y cerca?)", "not responding (is it on and nearby?)")
+    } else if low.contains("not ready") {
+        l("el bluetooth está apagado (p para prender)", "bluetooth is off (p to turn on)")
+    } else if low.contains("authentication") || low.contains("auth") && low.contains("fail") {
+        l("no se pudo emparejar (ponlo en modo emparejar)", "pairing failed (put it in pairing mode)")
+    } else if low.contains("inprogress") || low.contains("in progress") {
+        l("ya está en eso, espera", "already in progress, hold on")
+    } else if low.contains("alreadyexists") || low.contains("already exists") {
+        l("ya está emparejado", "already paired")
+    } else if low.contains("connection refused") || low.contains("profile-unavailable") {
+        l("el dispositivo no aceptó (¿está conectado a otro?)", "the device refused (connected elsewhere?)")
+    } else if low.contains("doesnotexist") || low.contains("does not exist") {
+        l("ya no está", "it's gone")
+    } else {
+        last
+    };
+    human.to_string()
 }
 
 fn icon(kind: &str) -> &'static str {
@@ -384,6 +403,10 @@ impl Tab for Bluetooth {
             _ => return false,
         }
         true
+    }
+
+    fn scroll(&mut self, down: bool, _ui: &mut Ui) {
+        self.sel = if down { (self.sel + 1).min(self.devices.len().saturating_sub(1)) } else { self.sel.saturating_sub(1) };
     }
 
     fn hints(&self) -> Vec<(&'static str, &'static str)> {

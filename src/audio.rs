@@ -1,4 +1,5 @@
-//! Audio: salidas, entradas y el volumen de cada app (PipeWire vía pactl).
+//! Audio: salidas, entradas, el volumen de cada app y las que están usando
+//! un micrófono (PipeWire vía pactl).
 //! `pactl subscribe` avisa de cualquier cambio y la lista se relee sola.
 
 use crate::{Tab, Ui, l};
@@ -21,6 +22,7 @@ enum Kind {
     Out,
     In,
     App,
+    Rec, // una app grabando de una entrada
 }
 
 #[derive(Clone)]
@@ -78,17 +80,23 @@ impl Audio {
     pub fn new() -> Audio {
         let dirty = Arc::new(AtomicBool::new(true));
         // cualquier cambio en el servidor de audio: releer
+        // (si PipeWire se reinicia, pactl subscribe se muere: volver a empezar)
         let d = dirty.clone();
         std::thread::spawn(move || {
             use std::io::BufRead;
-            if let Ok(mut child) = Command::new("pactl").arg("subscribe").stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
-                if let Some(out) = child.stdout.take() {
-                    for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
-                        if !line.contains("client") {
-                            d.store(true, Ordering::Relaxed);
+            loop {
+                if let Ok(mut child) = Command::new("pactl").arg("subscribe").stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
+                    if let Some(out) = child.stdout.take() {
+                        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                            if !line.contains("client") {
+                                d.store(true, Ordering::Relaxed);
+                            }
                         }
                     }
+                    let _ = child.wait();
                 }
+                d.store(true, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_secs(2));
             }
         });
         Audio { nodes: Vec::new(), sel: 0, dirty, last: Instant::now(), want_inputs: false }
@@ -157,6 +165,26 @@ impl Audio {
                 default: false,
             });
         }
+        // apps grabando de una entrada de verdad (no de un .monitor ni medidores)
+        for s in pactl(&["list", "source-outputs"]).unwrap_or(Value::Null).as_array().into_iter().flatten() {
+            let p = &s["properties"];
+            let src = s["source"].as_u64().unwrap_or(u64::MAX) as u32;
+            let Some(input) = nodes.iter().find(|n| n.kind == Kind::In && n.index == src) else { continue };
+            if p["stream.monitor"].as_str() == Some("true") {
+                continue;
+            }
+            let app = p["application.name"].as_str().or(p["application.process.binary"].as_str()).unwrap_or("?");
+            nodes.push(Node {
+                kind: Kind::Rec,
+                index: s["index"].as_u64().unwrap_or(0) as u32,
+                name: String::new(),
+                label: app.to_string(),
+                detail: input.label.clone(),
+                vol: volume(s),
+                mute: s["mute"].as_bool().unwrap_or(false),
+                default: false,
+            });
+        }
         let first = self.nodes.is_empty();
         self.nodes = nodes;
         // al abrir: en la salida predeterminada (o en la entrada con `vato mic`)
@@ -173,12 +201,13 @@ impl Audio {
             .unwrap_or(self.sel.min(self.nodes.len().saturating_sub(1)));
     }
 
-    fn set_volume(&self, n: &Node, v: u32) {
-        let v = format!("{}%", v.min(MAX));
+    /// `v` como "70%" (todos los canales igual) o "+5%" (cada canal, sin perder el balance)
+    fn set_volume(&self, n: &Node, v: &str) {
         match n.kind {
-            Kind::Out => run(&["set-sink-volume", &n.name, &v]),
-            Kind::In => run(&["set-source-volume", &n.name, &v]),
-            Kind::App => run(&["set-sink-input-volume", &n.index.to_string(), &v]),
+            Kind::Out => run(&["set-sink-volume", &n.name, v]),
+            Kind::In => run(&["set-source-volume", &n.name, v]),
+            Kind::App => run(&["set-sink-input-volume", &n.index.to_string(), v]),
+            Kind::Rec => run(&["set-source-output-volume", &n.index.to_string(), v]),
         }
     }
 
@@ -207,6 +236,16 @@ impl Audio {
                 run(&["move-sink-input", &n.index.to_string(), &outs[i].name]);
                 ui.say(format!("{} → {}", n.label, outs[i].label));
             }
+            Kind::Rec => {
+                // a la siguiente entrada
+                let ins: Vec<&Node> = self.nodes.iter().filter(|o| o.kind == Kind::In).collect();
+                if ins.is_empty() {
+                    return;
+                }
+                let i = ins.iter().position(|o| o.label == n.detail).map(|i| (i + 1) % ins.len()).unwrap_or(0);
+                run(&["move-source-output", &n.index.to_string(), &ins[i].name]);
+                ui.say(format!("{} ← {}", n.label, ins[i].label));
+            }
         }
         self.dirty.store(true, Ordering::Relaxed);
     }
@@ -214,7 +253,11 @@ impl Audio {
     fn nudge(&mut self, d: i32) {
         if let Some(n) = self.nodes.get(self.sel).cloned() {
             let v = (n.vol as i32 + d).clamp(0, MAX as i32) as u32;
-            self.set_volume(&n, v);
+            if v as i32 == n.vol as i32 + d {
+                self.set_volume(&n, &format!("{d:+}%"));
+            } else {
+                self.set_volume(&n, &format!("{v}%"));
+            }
             self.nodes[self.sel].vol = v;
             self.dirty.store(true, Ordering::Relaxed);
         }
@@ -226,6 +269,7 @@ impl Audio {
                 Kind::Out => run(&["set-sink-mute", &n.name, "toggle"]),
                 Kind::In => run(&["set-source-mute", &n.name, "toggle"]),
                 Kind::App => run(&["set-sink-input-mute", &n.index.to_string(), "toggle"]),
+                Kind::Rec => run(&["set-source-output-mute", &n.index.to_string(), "toggle"]),
             }
             self.dirty.store(true, Ordering::Relaxed);
         }
@@ -264,6 +308,7 @@ impl Tab for Audio {
                     Kind::Out => l("salidas", "outputs"),
                     Kind::In => l("entradas", "inputs"),
                     Kind::App => l("apps", "apps"),
+                    Kind::Rec => l("usando el micrófono", "using the mic"),
                 };
                 lines.push(Line::styled(format!(" {}", look.tx(title)), Style::new().fg(t.muted).bold()));
                 last_kind = Some(n.kind);
@@ -317,7 +362,7 @@ impl Tab for Audio {
             KeyCode::Enter | KeyCode::Char(' ') => self.act(ui),
             KeyCode::Char('0') => {
                 if let Some(n) = self.nodes.get(self.sel).cloned() {
-                    self.set_volume(&n, 100);
+                    self.set_volume(&n, "100%");
                     self.dirty.store(true, Ordering::Relaxed);
                 }
             }
@@ -333,6 +378,7 @@ impl Tab for Audio {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         let enter = match self.nodes.get(self.sel).map(|n| n.kind) {
             Some(Kind::App) => l("cambiar salida", "move output"),
+            Some(Kind::Rec) => l("cambiar entrada", "move input"),
             _ => l("predeterminada", "make default"),
         };
         vec![("j/k", l("mover", "move")), ("h/l", l("volumen", "volume")), ("m", l("mudo", "mute")), ("enter", enter), ("0", "100%")]

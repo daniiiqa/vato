@@ -9,6 +9,7 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
@@ -28,18 +29,31 @@ struct Wifi {
     signal: u8,
     secure: bool,
     active: bool,
-    saved: bool,
+    /// el perfil guardado de esta red, si hay
+    uuid: Option<String>,
+}
+
+/// Una VPN guardada (vpn o wireguard), conectada o no.
+#[derive(Clone)]
+struct Vpn {
+    name: String,
+    uuid: String,
+    active: bool,
 }
 
 #[derive(Clone)]
 enum Row {
     Dev(Dev),
+    Vpn(Vpn),
     Wifi(Wifi),
 }
 
 pub struct Network {
     devs: Vec<Dev>,
+    vpns: Vec<Vpn>,
     wifis: Vec<Wifi>,
+    /// uuid de un perfil wifi → su SSID (el nombre del perfil puede ser otro)
+    ssids: HashMap<String, String>,
     radio: bool,
     has_wifi: bool,
     sel: usize,
@@ -49,7 +63,8 @@ pub struct Network {
     rx: Receiver<Result<String, String>>,
     /// pidiendo contraseña: (ssid, lo escrito, mostrarla)
     pass: Option<(String, String, bool)>,
-    forget: Option<String>,
+    /// olvidar: (ssid, uuid del perfil)
+    forget: Option<(String, String)>,
     /// desconectar pide un segundo enter (para no quedarse sin internet sin querer)
     confirm_down: Option<String>,
 }
@@ -87,7 +102,9 @@ impl Network {
         let (tx, rx) = channel();
         Network {
             devs: Vec::new(),
+            vpns: Vec::new(),
             wifis: Vec::new(),
+            ssids: HashMap::new(),
             radio: false,
             has_wifi: false,
             sel: 0,
@@ -102,14 +119,20 @@ impl Network {
     }
 
     fn rows(&self) -> Vec<Row> {
-        self.devs.iter().cloned().map(Row::Dev).chain(self.wifis.iter().cloned().map(Row::Wifi)).collect()
+        self.devs
+            .iter()
+            .cloned()
+            .map(Row::Dev)
+            .chain(self.vpns.iter().cloned().map(Row::Vpn))
+            .chain(self.wifis.iter().cloned().map(Row::Wifi))
+            .collect()
     }
 
     fn load(&mut self) {
         let mut devs = Vec::new();
         for line in nmcli(&["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"]).unwrap_or_default().lines() {
             let f = fields(line);
-            if f.len() < 4 || matches!(f[1].as_str(), "loopback" | "bridge" | "wifi-p2p" | "tun") {
+            if f.len() < 4 || matches!(f[1].as_str(), "loopback" | "bridge" | "wifi-p2p" | "tun" | "wireguard") {
                 continue;
             }
             let ip = if f[2].starts_with("connected") {
@@ -125,13 +148,28 @@ impl Network {
         }
         self.has_wifi = devs.iter().any(|d| d.kind == "wifi");
         self.radio = nmcli(&["-t", "radio", "wifi"]).unwrap_or_default().trim() == "enabled";
-        let saved: Vec<String> = nmcli(&["-t", "-f", "NAME,TYPE", "connection", "show"])
-            .unwrap_or_default()
-            .lines()
-            .map(fields)
-            .filter(|f| f.len() >= 2 && f[1].contains("wireless"))
-            .map(|f| f[0].clone())
-            .collect();
+        // perfiles guardados: wifi (por SSID, que puede no ser su nombre) y VPNs
+        let mut saved: Vec<(String, String)> = Vec::new();
+        let mut vpns = Vec::new();
+        for f in nmcli(&["-t", "-f", "NAME,UUID,TYPE,ACTIVE", "connection", "show"]).unwrap_or_default().lines().map(fields) {
+            if f.len() < 4 {
+                continue;
+            }
+            match f[2].as_str() {
+                "802-11-wireless" => {
+                    let ssid = self.ssids.entry(f[1].clone()).or_insert_with(|| {
+                        nmcli(&["-g", "802-11-wireless.ssid", "connection", "show", &f[1]])
+                            .map(|s| s.trim().to_string())
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| f[0].clone())
+                    });
+                    saved.push((ssid.clone(), f[1].clone()));
+                }
+                "vpn" | "wireguard" => vpns.push(Vpn { name: f[0].clone(), uuid: f[1].clone(), active: f[3] == "yes" }),
+                _ => {}
+            }
+        }
         let mut wifis: Vec<Wifi> = Vec::new();
         if self.has_wifi && self.radio {
             for line in nmcli(&["-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "device", "wifi", "list", "--rescan", "no"]).unwrap_or_default().lines() {
@@ -143,7 +181,7 @@ impl Network {
                     active: f[0] == "*",
                     signal: f[2].parse().unwrap_or(0),
                     secure: !f[3].is_empty() && f[3] != "--",
-                    saved: saved.contains(&f[1]),
+                    uuid: saved.iter().find(|(s, _)| *s == f[1]).map(|(_, u)| u.clone()),
                     ssid: f[1].clone(),
                 };
                 // la misma red en varios puntos de acceso: la más fuerte
@@ -153,10 +191,11 @@ impl Network {
                     None => wifis.push(w),
                 }
             }
-            wifis.sort_by(|a, b| (!a.active, !a.saved, std::cmp::Reverse(a.signal)).cmp(&(!b.active, !b.saved, std::cmp::Reverse(b.signal))));
+            wifis.sort_by_key(|w| (!w.active, w.uuid.is_none(), std::cmp::Reverse(w.signal)));
         }
         let keep = self.key_of(self.sel);
         self.devs = devs;
+        self.vpns = vpns;
         self.wifis = wifis;
         let rows = self.rows();
         self.sel = keep
@@ -167,6 +206,7 @@ impl Network {
     fn row_key(r: &Row) -> String {
         match r {
             Row::Dev(d) => format!("dev:{}", d.name),
+            Row::Vpn(v) => format!("vpn:{}", v.uuid),
             Row::Wifi(w) => format!("wifi:{}", w.ssid),
         }
     }
@@ -183,13 +223,17 @@ impl Network {
         });
     }
 
+    /// Una red sin perfil: nmcli lo crea al conectar, y si falla (contraseña
+    /// mala) lo deja guardado y ya no la vuelve a pedir; ese se borra.
     fn connect_wifi(&mut self, ssid: String, password: Option<String>) {
         self.spawn(format!("{} {ssid}…", l("Conectando a", "Connecting to")), move || {
             let mut args = vec!["device", "wifi", "connect", ssid.as_str()];
             if let Some(p) = &password {
                 args.extend(["password", p.as_str()]);
             }
-            nmcli(&args).map(|_| format!("{}: {ssid}", l("Conectado", "Connected")))
+            nmcli(&args).map(|_| format!("{}: {ssid}", l("Conectado", "Connected"))).inspect_err(|_| {
+                let _ = nmcli(&["connection", "delete", "id", &ssid]);
+            })
         });
     }
 
@@ -211,6 +255,16 @@ impl Network {
                     },
                 );
             }
+            Some(Row::Vpn(v)) => {
+                let (name, uuid, up) = (v.name, v.uuid, !v.active);
+                self.spawn(
+                    format!("{} {name}…", if up { l("Conectando", "Connecting") } else { l("Desconectando", "Disconnecting") }),
+                    move || {
+                        nmcli(&["connection", if up { "up" } else { "down" }, &uuid])
+                            .map(|_| format!("{name}: {}", if up { l("conectado", "connected") } else { l("desconectado", "disconnected") }))
+                    },
+                );
+            }
             Some(Row::Wifi(w)) if w.active => {
                 let ssid = w.ssid.clone();
                 if self.confirm_down.as_deref() != Some(ssid.as_str()) {
@@ -218,9 +272,23 @@ impl Network {
                     return;
                 }
                 self.confirm_down = None;
-                self.spawn(String::new(), move || nmcli(&["connection", "down", &ssid]).map(|_| format!("{ssid}: {}", l("desconectado", "disconnected"))));
+                // bajar el perfil (no el aparato, que deja el wifi sin autoconectar)
+                let dev = self.devs.iter().find(|d| d.kind == "wifi" && d.state.starts_with("connected")).map(|d| d.name.clone());
+                self.spawn(String::new(), move || {
+                    match (w.uuid, dev) {
+                        (Some(u), _) => nmcli(&["connection", "down", &u]),
+                        (None, Some(d)) => nmcli(&["device", "disconnect", &d]),
+                        (None, None) => nmcli(&["connection", "down", "id", &ssid]),
+                    }
+                    .map(|_| format!("{ssid}: {}", l("desconectado", "disconnected")))
+                });
             }
-            Some(Row::Wifi(w)) if w.secure && !w.saved => self.pass = Some((w.ssid, String::new(), false)),
+            Some(Row::Wifi(Wifi { ssid, uuid: Some(u), .. })) => {
+                self.spawn(format!("{} {ssid}…", l("Conectando a", "Connecting to")), move || {
+                    nmcli(&["connection", "up", &u]).map(|_| format!("{}: {ssid}", l("Conectado", "Connected")))
+                });
+            }
+            Some(Row::Wifi(w)) if w.secure => self.pass = Some((w.ssid, String::new(), false)),
             Some(Row::Wifi(w)) => self.connect_wifi(w.ssid, None),
             None => {}
         }
@@ -288,19 +356,35 @@ impl Tab for Network {
                 Span::styled(format!(" {:>18}", d.ip), Style::new().fg(t.primary)),
             ]));
         }
-        lines.push(Line::raw(""));
-        let wifi_state = if !self.has_wifi {
-            l("sin adaptador wifi", "no wifi adapter")
-        } else if self.radio {
-            l("encendido", "on")
-        } else {
-            l("apagado", "off")
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {} ", look.tx("wifi")), Style::new().fg(t.muted).bold()),
-            Span::styled(look.tx(wifi_state), Style::new().fg(if self.radio && self.has_wifi { t.primary } else { t.muted })),
-        ]));
-        let base = self.devs.len();
+        if !self.vpns.is_empty() {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(format!(" {}", look.tx("vpn")), Style::new().fg(t.muted).bold()));
+        }
+        for (j, v) in self.vpns.iter().enumerate() {
+            let selected = self.devs.len() + j == self.sel;
+            if selected {
+                sel_line = lines.len();
+            }
+            let name: String = format!("\u{f0582} {}", v.name).chars().take(w.saturating_sub(22)).collect();
+            let pad = w.saturating_sub(22 + name.chars().count());
+            let state = if v.active { l("conectada", "connected") } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled(if selected { mark } else { " " }, Style::new().fg(t.primary)),
+                Span::styled(format!("{name}{}", " ".repeat(pad)), if selected { sel_style } else { Style::new().fg(if v.active { t.fg } else { t.muted }) }),
+                Span::styled(format!(" {:>18}", look.tx(state)), Style::new().fg(t.primary)),
+            ]));
+        }
+        if self.has_wifi {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {} ", look.tx("wifi")), Style::new().fg(t.muted).bold()),
+                Span::styled(
+                    look.tx(if self.radio { l("encendido", "on") } else { l("apagado", "off") }),
+                    Style::new().fg(if self.radio { t.primary } else { t.muted }),
+                ),
+            ]));
+        }
+        let base = self.devs.len() + self.vpns.len();
         let lv = look.levels();
         for (j, wf) in self.wifis.iter().enumerate() {
             let selected = base + j == self.sel;
@@ -311,7 +395,7 @@ impl Tab for Network {
                 .map(|k| if wf.signal as usize > k * 25 { lv[(k * 2 + 1).min(lv.len() - 1)] } else { ' ' })
                 .collect();
             let lock = if wf.secure { "\u{f033e}" } else { " " };
-            let tag = if wf.active { l("conectado", "connected") } else if wf.saved { l("guardada", "saved") } else { "" };
+            let tag = if wf.active { l("conectado", "connected") } else if wf.uuid.is_some() { l("guardada", "saved") } else { "" };
             let name: String = wf.ssid.chars().take(w.saturating_sub(30)).collect();
             let pad = w.saturating_sub(30 + name.chars().count());
             lines.push(Line::from(vec![
@@ -340,7 +424,7 @@ impl Tab for Network {
                 Style::new().fg(t.red).bold(),
             ));
         }
-        if let Some(ssid) = &self.forget {
+        if let Some((ssid, _)) = &self.forget {
             lines.push(Line::raw(""));
             lines.push(Line::styled(
                 format!(" {} {ssid}? (f {} · esc {})", l("¿Olvidar", "Forget"), l("sí", "yes"), l("no", "no")),
@@ -370,9 +454,9 @@ impl Tab for Network {
             }
             return true;
         }
-        if let Some(ssid) = self.forget.take() {
+        if let Some((ssid, uuid)) = self.forget.take() {
             if k.code == KeyCode::Char('f') {
-                self.spawn(String::new(), move || nmcli(&["connection", "delete", &ssid]).map(|_| format!("{ssid}: {}", l("olvidada", "forgotten"))));
+                self.spawn(String::new(), move || nmcli(&["connection", "delete", &uuid]).map(|_| format!("{ssid}: {}", l("olvidada", "forgotten"))));
             }
             return true;
         }
@@ -380,7 +464,7 @@ impl Tab for Network {
             self.confirm_down = None;
             return true;
         }
-        let n = self.devs.len() + self.wifis.len();
+        let n = self.rows().len();
         match k.code {
             KeyCode::Down | KeyCode::Char('j') => self.sel = (self.sel + 1).min(n.saturating_sub(1)),
             KeyCode::Up | KeyCode::Char('k') => self.sel = self.sel.saturating_sub(1),
@@ -398,10 +482,8 @@ impl Tab for Network {
                 });
             }
             KeyCode::Char('f') => {
-                if let Some(Row::Wifi(w)) = self.rows().get(self.sel) {
-                    if w.saved {
-                        self.forget = Some(w.ssid.clone());
-                    }
+                if let Some(Row::Wifi(Wifi { ssid, uuid: Some(u), .. })) = self.rows().get(self.sel) {
+                    self.forget = Some((ssid.clone(), u.clone()));
                 }
             }
             _ => return false,
@@ -413,6 +495,7 @@ impl Tab for Network {
         let enter = match self.rows().get(self.sel) {
             Some(Row::Dev(d)) if d.state.starts_with("connected") => l("desconectar", "disconnect"),
             Some(Row::Wifi(w)) if w.active => l("desconectar", "disconnect"),
+            Some(Row::Vpn(v)) if v.active => l("desconectar", "disconnect"),
             Some(_) => l("conectar", "connect"),
             None => "",
         };
@@ -421,9 +504,18 @@ impl Tab for Network {
             v.push(("enter", enter));
         }
         if self.has_wifi {
-            v.extend([("r", l("buscar redes", "rescan")), ("w", l("wifi on/off", "wifi on/off")), ("f", l("olvidar", "forget"))]);
+            v.extend([("r", l("buscar redes", "rescan")), ("w", l("wifi on/off", "wifi on/off"))]);
+        }
+        if matches!(self.rows().get(self.sel), Some(Row::Wifi(Wifi { uuid: Some(_), .. }))) {
+            v.push(("f", l("olvidar", "forget")));
         }
         v
+    }
+
+    fn scroll(&mut self, down: bool, _ui: &mut Ui) {
+        if self.pass.is_none() {
+            self.sel = if down { (self.sel + 1).min(self.rows().len().saturating_sub(1)) } else { self.sel.saturating_sub(1) };
+        }
     }
 }
 
