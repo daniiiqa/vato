@@ -124,13 +124,16 @@ fn kitty_theme() -> PathBuf {
         .ok()
         .and_then(|text| {
             text.lines()
-                .filter_map(|l| l.trim().strip_prefix("include"))
-                .map(|p| match p.trim().strip_prefix("~/") {
+                // la ruta es la primera palabra: lo demás puede ser un comentario
+                // (`include ./kitty-themes/01-Wallust.conf   # colores del look`)
+                .filter_map(|l| l.trim().strip_prefix("include")?.split_whitespace().next())
+                .map(|p| match p.strip_prefix("~/") {
                     Some(rest) => home().join(rest),
-                    None => dir.join(p.trim()),
+                    None => dir.join(p),
                 })
                 .rev()
-                .find(|p| std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l.starts_with("background"))))
+                // el de los colores: con `background` (no `background_opacity`)
+                .find(|p| std::fs::read_to_string(p).is_ok_and(|t| t.lines().any(|l| l.split_whitespace().next() == Some("background"))))
         })
         .unwrap_or(conf)
 }
