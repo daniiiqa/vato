@@ -216,6 +216,16 @@ impl Audio {
             let p = &s["properties"];
             let app = p["application.name"].as_str().or(p["application.process.binary"].as_str()).unwrap_or("?");
             let media = p["media.name"].as_str().unwrap_or("");
+            // un cel que suena por aquí por Bluetooth no es una app: «Daniel's S21 · aptX»
+            // (sus botones de volumen mueven este canal)
+            let label = match (p["device.api"].as_str(), p["device.description"].as_str()) {
+                (Some("bluez5"), Some(phone)) => match media.split_once("(codec ").and_then(|(_, c)| c.strip_suffix(')')) {
+                    Some(codec) => format!("{phone} · {codec}"),
+                    None => phone.to_string(),
+                },
+                _ if media.is_empty() || media == app => app.to_string(),
+                _ => format!("{app} · {media}"),
+            };
             nodes.push(Node {
                 card: String::new(),
                 ports: Vec::new(),
@@ -223,7 +233,7 @@ impl Audio {
                 kind: Kind::App,
                 index: s["index"].as_u64().unwrap_or(0) as u32,
                 name: String::new(),
-                label: if media.is_empty() || media == app { app.to_string() } else { format!("{app} · {media}") },
+                label,
                 detail: sink_name(s["sink"].as_u64().unwrap_or(u64::MAX)),
                 vol: volume(s),
                 mute: s["mute"].as_bool().unwrap_or(false),
