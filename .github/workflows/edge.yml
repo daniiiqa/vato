@@ -1,0 +1,45 @@
+name: edge
+
+# En cada push a la rama principal: el binario listo para discada, en la release
+# `edge` (la que baja install.sh / "actualizar discada" en vez de compilar).
+# <app>-x86_64-linux, su .sha256 y <app>.commit (el commit del que salió; va al
+# último, así quien lo ve nuevo ya encuentra el binario nuevo).
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: edge
+  cancel-in-progress: true
+
+jobs:
+  edge:
+    runs-on: ubuntu-latest
+    env:
+      APP: ${{ github.event.repository.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # jale y rollo enlazan libxkbcommon; las barras y menús, wayland
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libxkbcommon-dev libwayland-dev
+      - run: cargo build --release --locked
+      - name: armar
+        run: |
+          cp "target/release/$APP" "$APP-x86_64-linux"
+          sha256sum "$APP-x86_64-linux" > "$APP-x86_64-linux.sha256"
+          echo "$GITHUB_SHA" > "$APP.commit"
+      - name: publicar
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push -f origin "$GITHUB_SHA:refs/tags/edge"
+          gh release view edge >/dev/null 2>&1 ||
+            gh release create edge --prerelease --title "$APP edge" \
+              --notes "El último commit de la rama principal, compilado para discada (x86_64). Lo baja install.sh."
+          gh release upload edge "$APP-x86_64-linux" "$APP-x86_64-linux.sha256" --clobber
+          gh release upload edge "$APP.commit" --clobber
